@@ -1,0 +1,28 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment files
+.env
+.env.*
+
+# Generated polygon outputs
+Polygons/
+Polygons dataset/local_dataset*.json
+Polygons dataset/*.png
+polygon_test.png
+
+# Editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
