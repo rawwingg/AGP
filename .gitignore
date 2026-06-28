@@ -21,6 +21,11 @@ Polygons dataset/local_dataset*.json
 Polygons dataset/*.png
 polygon_test.png
 
+# PPO training outputs
+logs/
+models/
+*.zip
+
 # Editor/OS noise
 .vscode/
 .idea/
