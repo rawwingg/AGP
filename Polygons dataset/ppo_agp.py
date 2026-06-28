@@ -375,8 +375,13 @@ def train(timesteps=TIMESTEPS):
     os.makedirs(MODEL_PATH.parent, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
 
+    # Use Apple GPU (MPS) when available; otherwise CPU. Only affects new runs.
+    import torch
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"Using device: {device}")
+
     # CnnPolicy: the policy/value networks start with convolutions that read the image.
-    model = PPO("CnnPolicy", env, verbose=1, tensorboard_log=str(LOG_DIR))
+    model = PPO("CnnPolicy", env, device=device, verbose=1, tensorboard_log=str(LOG_DIR))
     callback = TrainingMonitor(snapshot_env, SNAPSHOT_FREQ)
     print(f"Training PPO for {timesteps} timesteps on {len(polygons)} galleries...")
     model.learn(total_timesteps=timesteps, callback=callback)
