@@ -34,15 +34,18 @@ class Security:
         self.perimeter = Polygon(poly['outer_points'], holes=poly['holes'])
         self.area = poly['area']
         self.all_guards = dict()
-        self.coverage_areas = Point(250, 250) # Placeholder for the total coverage area, will need to be calculated later
-        self.percent_coverage = 0.0 # Placeholder for the percentage of coverage, will need to be calculated later
+        self.coverage_areas = Polygon()  # total covered region, starts empty
+        self.percent_coverage = 0.0
 
     def add_guard(self, guard): #step function to add a guard to the list of guards
         if self.perimeter.contains(guard.position):
             area_coverage = self.get_area_coverage_of_guard(guard)
+            # area this guard adds that was not already covered (the RL "+new area" term)
+            new_area = area_coverage.difference(self.coverage_areas).area
             self.all_guards[guard.get_position()] = area_coverage
             self.coverage_areas = self.coverage_areas.union(area_coverage)
             self.percent_coverage = (self.coverage_areas.area / self.perimeter.area)
+            return new_area
         else:
             raise ValueError("Guard position is outside the polygon perimeter.")
 
@@ -171,8 +174,8 @@ class Security:
             
     def remove_all_guards(self): #step function to remove all guards from the list of guards
         self.all_guards.clear()
-        self.coverage_areas = Point(250, 250) # Reset coverage area to placeholder
-        self.percent_coverage = 0.0 # Reset percentage of coverage to placeholder 
+        self.coverage_areas = Polygon()  # reset to empty coverage
+        self.percent_coverage = 0.0
 
     def get_all_guards(self): #step function to return the list of guards
         return dict(zip(self.all_guards.keys(), [area.exterior.coords for area in self.all_guards.values()]))
