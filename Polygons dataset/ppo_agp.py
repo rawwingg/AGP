@@ -57,6 +57,14 @@ N_TEST = 50              # number of test galleries
 TIMESTEPS = 500_000      # total PPO training steps
 SNAPSHOT_FREQ = 5_000    # every N steps, log a guard-placement image to TensorBoard
 
+# PPO stability knobs. Defaults caused huge policy updates (approx_kl in the tens/hundreds)
+# and late-training collapse; these keep each update small and well-behaved.
+LEARNING_RATE = 1e-4     # smaller steps than the 3e-4 default
+N_EPOCHS = 5             # fewer passes per rollout (default 10) -> less overfitting per update
+TARGET_KL = 0.03         # early-stop an update if the policy moves too far
+ENT_COEF = 0.0           # no extra entropy bonus
+EVAL_FREQ = 10_000       # every N steps, evaluate on the test set and keep the best model
+
 IMG_SIZE = 64            # observation is an IMG_SIZE x IMG_SIZE x 3 image fed to a CNN
 GUARD_COST = 0.05        # penalty per guard placed (the "-guard" reward term)
 COVERAGE_THRESHOLD = 0.95  # episode ends successfully at >= this coverage
@@ -217,6 +225,29 @@ class ArtGalleryEnv(gym.Env):
 
         return self._get_obs(), {}
 
+    def _snap_into_gallery(self, x, y):
+        """Return (x, y, was_invalid). If (x, y) is outside the gallery or in a hole,
+        project it to the nearest valid interior point so a guard can still be placed."""
+        from shapely.geometry import Point
+        from shapely.ops import nearest_points
+
+        pt = Point(x, y)
+        if self.security.perimeter.contains(pt):
+            return x, y, False
+
+        # Nearest point on the gallery's filled area (a boundary point for outside/in-hole).
+        nearest = nearest_points(self.security.perimeter, pt)[0]
+        nx, ny = nearest.x, nearest.y
+        # Nudge slightly inward toward a guaranteed-interior reference point until inside.
+        ref = self.security.perimeter.representative_point()
+        for t in (0.01, 0.05, 0.1, 0.25, 0.5):
+            cx = nx + (ref.x - nx) * t
+            cy = ny + (ref.y - ny) * t
+            if self.security.perimeter.contains(Point(cx, cy)):
+                return cx, cy, True
+        # Fallback: the representative point is always strictly inside.
+        return ref.x, ref.y, True
+
     def step(self, action):
         self.steps += 1
 
@@ -226,64 +257,63 @@ class ArtGalleryEnv(gym.Env):
         x = minx + float(a[0]) * (maxx - minx)
         y = miny + float(a[1]) * (maxy - miny)
 
+        # If the aim is invalid (outside the gallery or inside a hole), snap it to the
+        # nearest valid interior point. This GUARANTEES a guard is placed, so the
+        # observation always changes -- which stops deterministic eval from getting stuck
+        # repeating the same invalid action forever. We still record `was_invalid` so the
+        # agent is penalized for aiming poorly (it learns to aim inside on its own).
+        x, y, was_invalid = self._snap_into_gallery(x, y)
         guard = Guard(x, y)
 
         # --- Reward is built from clear, separate pieces (see docs/agp_ppo_design.md) ---
-        if not self.security.perimeter.contains(guard.position):
-            # WRONG AREA: the point is outside the gallery (or inside a hole).
-            # No guard is placed; we just penalize aiming at an invalid spot.
-            reward = -self.invalid_penalty
-            # Wasted step (added no area) -> counts toward the unproductive streak.
+        # Was this exact spot already covered BEFORE we place the new guard?
+        already_covered = self.security.coverage_areas.contains(guard.position)
+
+        # Distance to the closest existing guard (before this one is added).
+        too_close = False
+        if self.security.all_guards:
+            nearest = min(math.hypot(x - gx, y - gy)
+                          for gx, gy in self.security.all_guards.keys())
+            too_close = nearest < self.min_guard_dist
+
+        # Uncovered area BEFORE this guard, used for the relative productivity check.
+        uncovered_before = self.perimeter_area - self.security.coverage_areas.area
+
+        # add_guard returns the NEW area this guard contributes (overlap removed).
+        new_area = self.security.add_guard(guard)
+
+        # Update the covered image channel using this guard's coverage polygon.
+        coverage_poly = self.security.all_guards[guard.get_position()]
+        if not coverage_poly.is_empty:
+            newly = shapely.contains_xy(coverage_poly, self.grid_x, self.grid_y)
+            newly = np.asarray(newly, dtype=bool).reshape(self.img_size, self.img_size)
+            self.covered_mask |= newly
+
+        # 1) main term: fraction of newly covered area  (+ for new area)
+        area_term = new_area / self.perimeter_area
+        # 2) per-guard cost                              (- for each guard)
+        cost_term = self.guard_cost
+        # 3) placement shaping: reward the "right area", punish redundant spots
+        if already_covered:
+            placement_term = -self.redundant_penalty
+        else:
+            placement_term = self.placement_bonus
+        # 4) spacing: penalize a guard placed too close to an existing one
+        spacing_term = -self.close_penalty if too_close else 0.0
+        # 5) aim: penalize having aimed outside the gallery (guard was snapped inward)
+        invalid_term = -self.invalid_penalty if was_invalid else 0.0
+
+        reward = area_term - cost_term + placement_term + spacing_term + invalid_term
+
+        # Track "unproductive" guards relative to what was still uncovered: the guard
+        # must cover >= USEFUL_AREA_FRAC of the remaining uncovered area to count as
+        # productive. A guard stacked on an existing one adds ~0 area, so it lands in the
+        # unproductive branch -- this is how we treat it as a no-op the agent avoids.
+        productive_threshold = self.useful_area_frac * uncovered_before
+        if new_area < productive_threshold:
             self.unproductive_streak += 1
         else:
-            # Was this exact spot already covered BEFORE we place the new guard?
-            # (continuous test against the current coverage region, no grid involved)
-            already_covered = self.security.coverage_areas.contains(guard.position)
-
-            # Distance to the closest existing guard (before this one is added).
-            # Used to discourage clustering guards on top of each other.
-            too_close = False
-            if self.security.all_guards:
-                nearest = min(math.hypot(x - gx, y - gy)
-                              for gx, gy in self.security.all_guards.keys())
-                too_close = nearest < self.min_guard_dist
-
-            # Uncovered area BEFORE this guard, used for the relative productivity check.
-            uncovered_before = self.perimeter_area - self.security.coverage_areas.area
-
-            # add_guard returns the NEW area this guard contributes (overlap removed).
-            new_area = self.security.add_guard(guard)
-
-            # Update the covered image channel using this guard's coverage polygon.
-            coverage_poly = self.security.all_guards[guard.get_position()]
-            if not coverage_poly.is_empty:
-                newly = shapely.contains_xy(coverage_poly, self.grid_x, self.grid_y)
-                newly = np.asarray(newly, dtype=bool).reshape(self.img_size, self.img_size)
-                self.covered_mask |= newly
-
-            # 1) main term: fraction of newly covered area  (+ for new area)
-            area_term = new_area / self.perimeter_area
-            # 2) per-guard cost                              (- for each guard)
-            cost_term = self.guard_cost
-            # 3) placement shaping: reward the "right area", punish redundant spots
-            if already_covered:
-                placement_term = -self.redundant_penalty
-            else:
-                placement_term = self.placement_bonus
-            # 4) spacing: penalize a guard placed too close to an existing one
-            spacing_term = -self.close_penalty if too_close else 0.0
-
-            reward = area_term - cost_term + placement_term + spacing_term
-
-            # Track "unproductive" guards relative to what was still uncovered: the guard
-            # must cover >= USEFUL_AREA_FRAC of the remaining uncovered area to count as
-            # productive. A guard stacked on an existing one adds ~0 area, so it lands in the
-            # unproductive branch -- this is how we treat it as a no-op the agent avoids.
-            productive_threshold = self.useful_area_frac * uncovered_before
-            if new_area < productive_threshold:
-                self.unproductive_streak += 1
-            else:
-                self.unproductive_streak = 0   # productive guard resets the streak
+            self.unproductive_streak = 0   # productive guard resets the streak
 
         coverage = self.security.percent_coverage
         terminated = coverage >= self.coverage_threshold   # covered enough -> success
@@ -334,14 +364,19 @@ def _render_episode_figure(model, snapshot_env):
 # ----------------------------------------------------------------------------
 def train(timesteps=TIMESTEPS):
     from stable_baselines3 import PPO
-    from stable_baselines3.common.callbacks import BaseCallback
+    from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
     from stable_baselines3.common.logger import Figure
+    from stable_baselines3.common.monitor import Monitor
 
     polygons = load_dataset(TRAIN_PATH)
     env = ArtGalleryEnv(polygons, random_reset=True)
 
     # A fixed gallery used only for the snapshots, so we watch progress on the same room.
     snapshot_env = ArtGalleryEnv([polygons[0]], random_reset=False)
+
+    # Held-out test galleries used to periodically score the policy and keep the BEST one,
+    # so a late-training collapse can't overwrite a good earlier model.
+    eval_env = Monitor(ArtGalleryEnv(load_dataset(TEST_PATH), random_reset=True))
 
     class TrainingMonitor(BaseCallback):
         """Logs galleries processed (a scalar) and guard-placement images to TensorBoard."""
@@ -381,12 +416,33 @@ def train(timesteps=TIMESTEPS):
     print(f"Using device: {device}")
 
     # CnnPolicy: the policy/value networks start with convolutions that read the image.
-    model = PPO("CnnPolicy", env, device=device, verbose=1, tensorboard_log=str(LOG_DIR))
-    callback = TrainingMonitor(snapshot_env, SNAPSHOT_FREQ)
+    # The extra kwargs keep PPO updates small and stable (see the constants above).
+    model = PPO(
+        "CnnPolicy", env, device=device, verbose=1, tensorboard_log=str(LOG_DIR),
+        learning_rate=LEARNING_RATE,
+        n_epochs=N_EPOCHS,
+        target_kl=TARGET_KL,
+        ent_coef=ENT_COEF,
+    )
+
+    monitor_cb = TrainingMonitor(snapshot_env, SNAPSHOT_FREQ)
+    # EvalCallback scores the policy on the test galleries every EVAL_FREQ steps and saves
+    # the best-performing model to models/ (best_model.zip).
+    eval_cb = EvalCallback(
+        eval_env,
+        best_model_save_path=str(MODEL_PATH.parent),
+        log_path=str(LOG_DIR),
+        eval_freq=EVAL_FREQ,
+        n_eval_episodes=len(load_dataset(TEST_PATH)),
+        deterministic=True,
+        verbose=1,
+    )
+
     print(f"Training PPO for {timesteps} timesteps on {len(polygons)} galleries...")
-    model.learn(total_timesteps=timesteps, callback=callback)
+    model.learn(total_timesteps=timesteps, callback=[monitor_cb, eval_cb])
     model.save(str(MODEL_PATH))
-    print(f"Saved model to {MODEL_PATH}.zip")
+    print(f"Saved final model to {MODEL_PATH}.zip")
+    print(f"Best model (by test coverage) saved to {MODEL_PATH.parent / 'best_model'}.zip")
     return model
 
 
@@ -399,7 +455,15 @@ def test(save_previews=True):
     polygons = load_dataset(TEST_PATH)
     # random_reset=False so we walk through every test gallery in order, once each.
     env = ArtGalleryEnv(polygons, random_reset=False)
-    model = PPO.load(str(MODEL_PATH))
+
+    # Prefer the best model (highest test coverage during training); fall back to final.
+    best_path = MODEL_PATH.parent / "best_model"
+    if best_path.with_suffix(".zip").exists():
+        model = PPO.load(str(best_path))
+        print(f"Loaded best model: {best_path}.zip")
+    else:
+        model = PPO.load(str(MODEL_PATH))
+        print(f"Loaded final model: {MODEL_PATH}.zip")
 
     # Set up the preview renderer (matplotlib, no GUI window).
     if save_previews:

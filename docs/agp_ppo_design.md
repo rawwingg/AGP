@@ -50,15 +50,15 @@ continuous Art Gallery Problem.
 The reward is built from clear, separate pieces:
 
 ```
-if guard is OUTSIDE the gallery (wrong area):
-    reward = -INVALID_PENALTY            # no guard is placed
-else:
-    area_term      = new_area_covered / gallery_area     # + for new area
-    cost_term      = GUARD_COST                           # - per guard
-    placement_term = +PLACEMENT_BONUS  if the spot was uncovered (right area)
-                     -REDUNDANT_PENALTY if the spot was already covered (wasted)
-    spacing_term   = -CLOSE_PENALTY    if too close to an existing guard, else 0
-    reward = area_term - cost_term + placement_term + spacing_term
+# The aimed point is first SNAPPED into the gallery if it was invalid (see below),
+# so a guard is ALWAYS placed. was_invalid records whether snapping was needed.
+area_term      = new_area_covered / gallery_area     # + for new area
+cost_term      = GUARD_COST                           # - per guard
+placement_term = +PLACEMENT_BONUS  if the spot was uncovered (right area)
+                 -REDUNDANT_PENALTY if the spot was already covered (wasted)
+spacing_term   = -CLOSE_PENALTY    if too close to an existing guard, else 0
+invalid_term   = -INVALID_PENALTY  if the aim was outside (had to be snapped), else 0
+reward = area_term - cost_term + placement_term + spacing_term + invalid_term
 ```
 
 - **`area_term` (+)**: fraction of **newly** covered area (overlap with already-covered
@@ -68,8 +68,10 @@ else:
 - **`placement_term` (the "right area" shaping)**: gives a dense, immediate signal about
   *where* the guard landed, which helps a lot early in training:
   - placed inside the gallery in a still-**uncovered** spot → `+PLACEMENT_BONUS` (right area),
-  - placed inside but in an **already-covered** spot → `-REDUNDANT_PENALTY` (wasted),
-  - placed **outside** the gallery → `-INVALID_PENALTY` and no guard added (wrong area).
+  - placed inside but in an **already-covered** spot → `-REDUNDANT_PENALTY` (wasted).
+- **`invalid_term` (aiming outside)**: if the aimed point was outside the gallery or in a
+  hole, it is snapped inward (below) and this `-INVALID_PENALTY` is applied so the agent
+  still learns to aim inside on its own.
 - **`spacing_term` (the "not too close" rule)**: if the new guard is within
   `MIN_GUARD_DIST_FRAC` of the gallery's bounding-box diagonal from any existing guard,
   it gets `-CLOSE_PENALTY`. This discourages clustering guards on top of each other
@@ -91,6 +93,17 @@ no new area. Such a placement now collects the worst of the shaping terms at onc
 its `area_term` is ~0. The net reward is clearly negative, so the agent is pushed away
 from "stacking" guards. It also counts as **unproductive** (see early stop below).
 
+### Invalid aim is snapped into the gallery (robust placement)
+
+The action is a point in the gallery's bounding box, which includes regions outside the
+gallery and inside holes. If the aimed point is invalid, `_snap_into_gallery` projects it
+to the nearest valid interior point and the guard is placed there anyway (with the
+`invalid_term` penalty). This fixes a brittle failure mode: at evaluation we use the
+policy's deterministic (mean) action, and if that point was invalid, **no guard was placed,
+the observation never changed, so the same invalid action repeated forever** — ending the
+episode with 0 guards / 0% coverage (this is what happened on test gallery 14). Snapping
+guarantees a guard is placed, the observation changes, and the agent makes progress.
+
 ### Termination
 
 - **terminated**: coverage ≥ `COVERAGE_THRESHOLD` (e.g. 95%) — the gallery is covered.
@@ -108,10 +121,27 @@ from "stacking" guards. It also counts as **unproductive** (see early stop below
 
 ## Train / test split
 
-- Generate `N_TRAIN` (e.g. 100) galleries for training and `N_TEST` (e.g. 10) for testing.
+- Generate `N_TRAIN` (e.g. 500) galleries for training and `N_TEST` (e.g. 50) for testing.
 - Train PPO across the training galleries (a new random gallery each episode).
 - Evaluate the trained policy on the held-out test galleries and report, per gallery,
   the final coverage % and number of guards used.
+
+## Training stability
+
+The first long runs were **unstable**: `approx_kl` reached the tens/hundreds (should be
+~0.01–0.05) and `clip_fraction` ~0.7–0.8 (should be ~0.05–0.2). The policy peaked around
+150–200k steps and then **collapsed** (coverage dropped, guard count rose). Two measures
+address this:
+
+1. **Smaller, safer PPO updates** (constants at the top of `ppo_agp.py`):
+   - `LEARNING_RATE = 1e-4` (down from the 3e-4 default),
+   - `N_EPOCHS = 5` (down from 10),
+   - `TARGET_KL = 0.03` (early-stops an update before the policy moves too far),
+   - `ENT_COEF = 0.0`.
+2. **Keep the best model, not the last one.** An `EvalCallback` scores the policy on the
+   test galleries every `EVAL_FREQ` steps and saves the best one to `models/best_model.zip`.
+   `test()` loads `best_model.zip` if present, so a late collapse can't overwrite a good
+   earlier policy.
 
 ## Future ideas
 
