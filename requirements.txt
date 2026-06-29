@@ -1,0 +1,14 @@
+# Core RL stack
+gymnasium
+stable-baselines3[extra]
+torch
+
+# Polygon geometry (already used by the existing codebase)
+shapely
+
+# Visualisation (already used by the existing codebase)
+matplotlib
+Pillow
+
+# Numerical computing
+numpy

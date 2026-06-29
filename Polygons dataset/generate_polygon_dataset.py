@@ -130,6 +130,57 @@ def generate_extreme_polygons(count=10):
     return generate_polygons_with_holes(count, "extreme")
 
 
+def generate_dataset(total_count, output_path=None):
+    """
+    Generate ``total_count`` polygons split equally across easy, mid, and hard.
+
+    If ``total_count`` is not divisible by 3, the remainder goes to easy.
+    Each tier gets ``total_count // 3`` polygons, plus the remainder for easy.
+
+    Parameters
+    ----------
+    total_count : int
+        Total number of polygons to generate (e.g. 90, 120, 300).
+    output_path : str or Path, optional
+        If given, save the resulting list as JSON to this path.
+
+    Returns
+    -------
+    list[dict]
+        All generated polygon records with sequential IDs starting from 1.
+
+    Example
+    -------
+    >>> polygons = generate_dataset(90, output_path="data/polygon_dataset_90.json")
+    >>> len(polygons)  # 90
+    """
+    per_tier  = total_count // 3
+    remainder = total_count - per_tier * 3   # goes to easy
+
+    generated = []
+    for difficulty, count in [
+        ("easy", per_tier + remainder),
+        ("mid",  per_tier),
+        ("hard", per_tier),
+    ]:
+        print(f"  Generating {count} {difficulty} polygons...")
+        generated.extend(generate_polygons_with_holes(count, difficulty))
+
+    # Sequential IDs across the combined list
+    for i, poly in enumerate(generated, start=1):
+        poly["id"] = i
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(generated, indent=2), encoding="utf-8"
+        )
+        print(f"  Saved {len(generated)} polygons → {output_path}")
+
+    return generated
+
+
 if __name__ == "__main__":
     generated = []
     generated.extend(generate_easy_polygons(10))
