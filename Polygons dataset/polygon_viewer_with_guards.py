@@ -157,7 +157,9 @@ class GuardedPolygonViewer(tk.Tk):
 
         guards = record["guards"]
 
-        security = Security(record)
+        radius = record["guard range"]
+
+        security = Security(record, radius)
 
         self.title_label.configure(text=f"Polygon {record['id']}")
         self.meta_label.configure(
@@ -189,7 +191,7 @@ class GuardedPolygonViewer(tk.Tk):
             gx, gy = self.scale_points([guard], all_points)[0:2]
             self.draw_point(gx, gy,size=10, color="black")
 
-            coverage_polygon = security.get_area_coverage_of_guard(guard_obj)
+            coverage_polygon = security.get_area_coverage_of_guard(guard_obj, radius = radius)
             if coverage_polygon is None or coverage_polygon.is_empty:
                 continue
 
@@ -212,7 +214,7 @@ class GuardedPolygonViewer(tk.Tk):
             self.canvas.create_polygon(
                 scaled_coverage,
                 fill="#fef300",
-                outline="",
+                outline="orange",
                 width=2,
                 stipple="gray50"
             )

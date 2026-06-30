@@ -29,17 +29,18 @@ class Guard:
 
 class Security:
 
-    def __init__(self, poly): #Initialize the Security class with the polygon data
+    def __init__(self, poly, radius): #Initialize the Security class with the polygon data
 
         self.perimeter = Polygon(poly['outer_points'], holes=poly['holes'])
         self.area = poly['area']
         self.all_guards = dict()
         self.coverage_areas = Polygon()  # total covered region, starts empty
         self.percent_coverage = 0.0
+        self.range = radius
 
     def add_guard(self, guard): #step function to add a guard to the list of guards
         if self.perimeter.contains(guard.position):
-            area_coverage = self.get_area_coverage_of_guard(guard)
+            area_coverage = self.get_area_coverage_of_guard(guard, radius = self.range)
             # area this guard adds that was not already covered (the RL "+new area" term)
             new_area = area_coverage.difference(self.coverage_areas).area
             self.all_guards[guard.get_position()] = area_coverage
@@ -49,7 +50,7 @@ class Security:
         else:
             raise ValueError("Guard position is outside the polygon perimeter.")
 
-    def get_area_coverage_of_guard(self, guard):
+    def get_area_coverage_of_guard(self, guard, radius = None, deg = 3):
         if not self.perimeter.covers(guard.position):
             return Polygon()  # empty
 
@@ -60,27 +61,29 @@ class Security:
 
         x, y = guard.get_position()
 
+        max_dist = None
+
         # ray distance: large enough to reach polygon boundary
-        bminx, bminy, bmaxx, bmaxy = self.perimeter.bounds
-        max_dist = math.hypot(bmaxx - bminx, bmaxy - bminy) * 3.0
-        if max_dist <= 0:
-            max_dist = 1000.0
+        if radius is None:
+            if self.range is None:
+                bminx, bminy, bmaxx, bmaxy = self.perimeter.bounds
+                max_dist = math.hypot(bmaxx - bminx, bmaxy - bminy) * 3.0
+                if max_dist <= 0:
+                    max_dist = 1000.0
+            else:
+                max_dist = self.range
+        else:
+            max_dist = radius
 
         # angles to cast rays (vertex angles ± small epsilon)
-        eps = 1e-6
-        angles = []
-        for vx, vy in all_vertices:
-            # skip vertex equal to guard position
-            if abs(vx - x) < 1e-9 and abs(vy - y) < 1e-9:
-                continue
-            base = math.atan2(vy - y, vx - x)
-            angles.extend([base - eps, base, base + eps])
 
-        # remove duplicates while preserving numeric stability
-        angles = sorted(set(angles))
+        eps = math.radians(deg)
+
+        it = math.ceil(360/deg)
 
         hits = []
-        for angle in angles:
+        for i in range(0, it):
+            angle = eps * i
             ex = x + math.cos(angle) * max_dist
             ey = y + math.sin(angle) * max_dist
             ray = LineString([guard.position, Point(ex, ey)])
@@ -89,7 +92,10 @@ class Security:
             inter = ray.intersection(self.perimeter.boundary)
 
             if inter.is_empty:
-                continue
+                if Point(ex,ey).within(self.perimeter):
+                    hits.append((angle,(ex,ey)))
+                else:
+                    continue
 
             # gather candidate points from intersection geometry
             candidates = []
@@ -179,11 +185,14 @@ class Security:
 
     def get_all_guards(self): #step function to return the list of guards
         return dict(zip(self.all_guards.keys(), [area.exterior.coords for area in self.all_guards.values()]))
+    
+    def set_range(self, range):
+        self.range = range
 
     def __repr__(self):
         return f"Area = {self.area}, No of Guards = {len(self.all_guards)}, Area Coverage percentage = {self.percent_coverage * 100:.2f}%"
     
-def new_dataset_with_guards(original_dataset_path = LOCAL_DATASET_PATH, new_dataset_path = Path("Polygons") / "local_dataset_with_guards.json", min_guards_per_polygon = 1, max_guards_per_polygon = 2):
+def new_dataset_with_guards(original_dataset_path = LOCAL_DATASET_PATH, new_dataset_path = Path("Polygons") / "local_dataset_with_guards.json", min_guards_per_polygon = 1, max_guards_per_polygon = 2, radius = None):
 
     new_polygons = []
     
@@ -191,7 +200,7 @@ def new_dataset_with_guards(original_dataset_path = LOCAL_DATASET_PATH, new_data
         polygons = json.load(f)
 
     for polygon in polygons:
-        security = Security(polygon)
+        security = Security(polygon, radius)
         polygon['guards'] = []
         guards_per_polygon = random.randint(min_guards_per_polygon, max_guards_per_polygon)
         for _ in range(guards_per_polygon):
@@ -206,6 +215,7 @@ def new_dataset_with_guards(original_dataset_path = LOCAL_DATASET_PATH, new_data
                     continue
             polygon['guards'].append((x,y))
         polygon["area_coverage"] = security.percent_coverage
+        polygon["guard range"] = radius
         new_polygons.append(polygon)
 
     with open(new_dataset_path, 'w') as f:
@@ -220,4 +230,4 @@ def sort_points_clockwise(points, centre):
     return sorted_points
 
 if __name__ == "__main__":
-    new_dataset_with_guards(min_guards_per_polygon=1, max_guards_per_polygon=3)
+    new_dataset_with_guards(min_guards_per_polygon=1, max_guards_per_polygon=3, radius = 200)
