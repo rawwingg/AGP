@@ -67,7 +67,7 @@ EVAL_FREQ = 10_000       # every N steps, evaluate on the test set and keep the 
 
 IMG_SIZE = 64            # observation is an IMG_SIZE x IMG_SIZE x 3 image fed to a CNN
 GUARD_COST = 0.05        # penalty per guard placed (the "-guard" reward term)
-COVERAGE_THRESHOLD = 0.95  # episode ends successfully at >= this coverage
+COVERAGE_THRESHOLD = 0.98  # episode ends successfully at >= this coverage
 MAX_GUARDS = 20          # hard cap on guards per episode (episode length limit)
 
 # Placement shaping: reward putting the guard in the "right area".
@@ -91,12 +91,15 @@ CLOSE_PENALTY = 0.10        # penalty when a new guard is too close to an existi
 USEFUL_AREA_FRAC = 0.10   # guard must cover >= 10% of the remaining uncovered area
 PATIENCE = 3              # end the episode after this many unproductive guards in a row
 
-# File locations (relative to the "Polygons dataset" folder, like the other scripts)
+# File locations.
+# Datasets stay in the project, but training outputs are saved on Desktop/AGP so git/GitHub
+# Desktop refreshes cannot delete the model checkpoints or TensorBoard logs.
 TRAIN_PATH = Path("Polygons") / "train_polygons.json"
 TEST_PATH = Path("Polygons") / "test_polygons.json"
-MODEL_PATH = Path("..") / "models" / "ppo_agp"     # SB3 appends .zip
-LOG_DIR = Path("..") / "logs" / "ppo_agp"
-TEST_PREVIEW_DIR = Path("Polygons") / "test_previews"  # PNGs of the agent's test solutions
+RUNS_DIR = Path.home() / "Desktop" / "AGP"
+MODEL_PATH = RUNS_DIR / "models" / "ppo_agp"     # SB3 appends .zip
+LOG_DIR = RUNS_DIR / "logs" / "ppo_agp"
+TEST_PREVIEW_DIR = RUNS_DIR / "test_previews"  # PNGs of the agent's test solutions
 
 
 # ----------------------------------------------------------------------------
@@ -154,14 +157,20 @@ class ArtGalleryEnv(gym.Env):
         # Action: a point (x, y), each in [0, 1], later mapped onto the gallery bounds.
         self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        # Observation: an image (H, W, 3) the CNN "sees", with 3 channels:
-        #   ch0 = inside the gallery      (the room the agent must cover)
-        #   ch1 = already covered         (what guards can currently see)
-        #   ch2 = remaining to cover      (inside AND not yet covered = the "right area")
-        # uint8 0/255 is the format Stable-Baselines3's CnnPolicy expects for images.
-        self.observation_space = spaces.Box(
-            low=0, high=255, shape=(img_size, img_size, 3), dtype=np.uint8
-        )
+        # Observation is a DICT (MultiInputPolicy): a spatial image + non-spatial scalars.
+        #   image (H, W, 3) uint8 -- handled by a CNN:
+        #     ch0 = inside the gallery   (the room the agent must cover)
+        #     ch1 = already covered      (what guards can currently see)
+        #     ch2 = remaining to cover   (inside AND not yet covered = the "right area")
+        #   stats (2,) float -- handled by an MLP; info the image cannot convey:
+        #     [coverage_fraction, budget_used_fraction]
+        # The image alone can't reveal how much guard budget is spent (the covered channel
+        # is a union, so 1 guard vs 3 guards covering the same area look identical), so we
+        # feed these scalars explicitly.
+        self.observation_space = spaces.Dict({
+            "image": spaces.Box(low=0, high=255, shape=(img_size, img_size, 3), dtype=np.uint8),
+            "stats": spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32),
+        })
 
         # Episode state (filled in by reset()).
         self.security = None
@@ -197,13 +206,17 @@ class ArtGalleryEnv(gym.Env):
         self.covered_mask = np.zeros_like(self.inside_mask, dtype=bool)
 
     def _get_obs(self):
-        """Build the (H, W, 3) uint8 image the CNN sees."""
+        """Build the Dict observation: the (H, W, 3) image plus the (2,) stats vector."""
         remaining = self.inside_mask & (~self.covered_mask)
         img = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
         img[:, :, 0] = self.inside_mask.astype(np.uint8) * 255    # ch0: gallery interior
         img[:, :, 1] = self.covered_mask.astype(np.uint8) * 255   # ch1: covered so far
         img[:, :, 2] = remaining.astype(np.uint8) * 255           # ch2: still to cover
-        return img
+
+        coverage = float(np.clip(self.security.percent_coverage, 0.0, 1.0))
+        budget_used = float(np.clip(self.steps / self.max_guards, 0.0, 1.0))
+        stats = np.array([coverage, budget_used], dtype=np.float32)
+        return {"image": img, "stats": stats}
 
     # -- gym API -------------------------------------------------------------
     def reset(self, *, seed=None, options=None):
@@ -362,7 +375,7 @@ def _render_episode_figure(model, snapshot_env):
 # ----------------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------------
-def train(timesteps=TIMESTEPS):
+def train(timesteps=TIMESTEPS, continue_training=False):
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
     from stable_baselines3.common.logger import Figure
@@ -410,24 +423,12 @@ def train(timesteps=TIMESTEPS):
     os.makedirs(MODEL_PATH.parent, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    # Use Apple GPU (MPS) when available; otherwise CPU. Only affects new runs.
+    # Use Apple GPU (MPS) when available; otherwise CPU.
     import torch
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # CnnPolicy: the policy/value networks start with convolutions that read the image.
-    # The extra kwargs keep PPO updates small and stable (see the constants above).
-    model = PPO(
-        "CnnPolicy", env, device=device, verbose=1, tensorboard_log=str(LOG_DIR),
-        learning_rate=LEARNING_RATE,
-        n_epochs=N_EPOCHS,
-        target_kl=TARGET_KL,
-        ent_coef=ENT_COEF,
-    )
-
     monitor_cb = TrainingMonitor(snapshot_env, SNAPSHOT_FREQ)
-    # EvalCallback scores the policy on the test galleries every EVAL_FREQ steps and saves
-    # the best-performing model to models/ (best_model.zip).
     eval_cb = EvalCallback(
         eval_env,
         best_model_save_path=str(MODEL_PATH.parent),
@@ -438,8 +439,40 @@ def train(timesteps=TIMESTEPS):
         verbose=1,
     )
 
-    print(f"Training PPO for {timesteps} timesteps on {len(polygons)} galleries...")
-    model.learn(total_timesteps=timesteps, callback=[monitor_cb, eval_cb])
+    if continue_training:
+        # Resume from the best checkpoint if available, else the last saved model.
+        best_path = MODEL_PATH.parent / "best_model"
+        if best_path.with_suffix(".zip").exists():
+            load_path = best_path
+            print(f"Continuing from {load_path}.zip")
+        elif MODEL_PATH.with_suffix(".zip").exists():
+            load_path = MODEL_PATH
+            print(f"Continuing from {load_path}.zip (no best_model found)")
+        else:
+            raise FileNotFoundError(
+                f"No checkpoint found in {MODEL_PATH.parent}. Train from scratch first."
+            )
+        model = PPO.load(str(load_path), env=env, device=device)
+        start = model.num_timesteps
+        print(f"Checkpoint at {start:,} timesteps; training {timesteps:,} more "
+              f"(target ~{start + timesteps:,} total).")
+        model.learn(
+            total_timesteps=timesteps,
+            callback=[monitor_cb, eval_cb],
+            reset_num_timesteps=False,  # keep TensorBoard step counter continuous
+        )
+    else:
+        # MultiInputPolicy: a CNN reads the image and an MLP reads the stats vector;
+        # SB3 combines them before the policy/value heads.
+        model = PPO(
+            "MultiInputPolicy", env, device=device, verbose=1, tensorboard_log=str(LOG_DIR),
+            learning_rate=LEARNING_RATE,
+            n_epochs=N_EPOCHS,
+            target_kl=TARGET_KL,
+            ent_coef=ENT_COEF,
+        )
+        print(f"Training PPO for {timesteps} timesteps on {len(polygons)} galleries...")
+        model.learn(total_timesteps=timesteps, callback=[monitor_cb, eval_cb])
     model.save(str(MODEL_PATH))
     print(f"Saved final model to {MODEL_PATH}.zip")
     print(f"Best model (by test coverage) saved to {MODEL_PATH.parent / 'best_model'}.zip")
@@ -519,8 +552,11 @@ def main():
     parser = argparse.ArgumentParser(description="PPO for the Art Gallery Problem.")
     parser.add_argument("--generate", action="store_true", help="(re)generate datasets only")
     parser.add_argument("--train", action="store_true", help="train only")
+    parser.add_argument("--continue", dest="continue_training", action="store_true",
+                        help="resume from models/best_model.zip (or ppo_agp.zip)")
     parser.add_argument("--test", action="store_true", help="test only")
-    parser.add_argument("--steps", type=int, default=TIMESTEPS, help="training timesteps")
+    parser.add_argument("--steps", type=int, default=TIMESTEPS,
+                        help="training timesteps (additional steps when using --continue)")
     args = parser.parse_args()
 
     # If no specific flag is given, do the full pipeline.
@@ -533,7 +569,7 @@ def main():
             generate_datasets()
 
     if args.train or do_all:
-        train(timesteps=args.steps)
+        train(timesteps=args.steps, continue_training=args.continue_training)
 
     if args.test or do_all:
         test()
