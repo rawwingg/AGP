@@ -9,6 +9,47 @@ from shapely.validation import make_valid
 
 LOCAL_DATASET_PATH = Path("Polygons") / "local_dataset.json"
 
+
+def _clean_geom(geom):
+    """Return a valid version of a geometry (fixes self-touching / near-degenerate edges)."""
+    if geom is None or geom.is_empty:
+        return geom
+    if not geom.is_valid:
+        geom = make_valid(geom)
+    # buffer(0) noded/cleans most floating-point artifacts from the ray-cast polygon.
+    if not geom.is_valid:
+        geom = geom.buffer(0)
+    return geom
+
+
+def _safe_difference(a, b):
+    """a - b, retrying with a snapped precision grid if GEOS hits a topology error."""
+    try:
+        return a.difference(b)
+    except Exception:
+        try:
+            from shapely import set_precision
+            a2 = set_precision(a, 1e-6)
+            b2 = set_precision(b, 1e-6)
+            return a2.difference(b2)
+        except Exception:
+            # last resort: clean both via buffer(0) and try once more
+            return a.buffer(0).difference(b.buffer(0))
+
+
+def _safe_union(a, b):
+    """a ∪ b, retrying with a snapped precision grid if GEOS hits a topology error."""
+    try:
+        return a.union(b)
+    except Exception:
+        try:
+            from shapely import set_precision
+            a2 = set_precision(a, 1e-6)
+            b2 = set_precision(b, 1e-6)
+            return a2.union(b2)
+        except Exception:
+            return a.buffer(0).union(b.buffer(0))
+
 class Guard:
     def __init__(self, x, y):
         self.position = Point(x, y)
@@ -41,10 +82,11 @@ class Security:
     def add_guard(self, guard): #step function to add a guard to the list of guards
         if self.perimeter.contains(guard.position):
             area_coverage = self.get_area_coverage_of_guard(guard, radius = self.range)
+            area_coverage = _clean_geom(area_coverage)
             # area this guard adds that was not already covered (the RL "+new area" term)
-            new_area = area_coverage.difference(self.coverage_areas).area
+            new_area = _safe_difference(area_coverage, self.coverage_areas).area
             self.all_guards[guard.get_position()] = area_coverage
-            self.coverage_areas = self.coverage_areas.union(area_coverage)
+            self.coverage_areas = _safe_union(self.coverage_areas, area_coverage)
             self.percent_coverage = (self.coverage_areas.area / self.perimeter.area)
             return new_area
         else:
@@ -175,7 +217,11 @@ class Security:
     def remove_guard(self, guard): #step function to remove a guards from the list of guards
         if guard.get_position() in self.all_guards:
             del self.all_guards[guard.get_position()]
-            self.coverage_areas = unary_union(list(self.all_guards.values()))
+            try:
+                self.coverage_areas = unary_union(list(self.all_guards.values()))
+            except Exception:
+                cleaned = [_clean_geom(g) for g in self.all_guards.values()]
+                self.coverage_areas = unary_union(cleaned) if cleaned else Polygon()
             self.percent_coverage = (self.coverage_areas.area / self.perimeter.area)
             
     def remove_all_guards(self): #step function to remove all guards from the list of guards
