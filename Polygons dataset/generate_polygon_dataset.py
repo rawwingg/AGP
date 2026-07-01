@@ -132,15 +132,14 @@ def generate_extreme_polygons(count=10):
 
 def generate_dataset(total_count, output_path=None):
     """
-    Generate ``total_count`` polygons split equally across easy, mid, and hard.
+    Generate ``total_count`` polygons split equally across easy, mid, hard, and extreme.
 
-    If ``total_count`` is not divisible by 3, the remainder goes to easy.
-    Each tier gets ``total_count // 3`` polygons, plus the remainder for easy.
+    If ``total_count`` is not divisible by 4, the remainder goes to easy.
 
     Parameters
     ----------
     total_count : int
-        Total number of polygons to generate (e.g. 90, 120, 300).
+        Total number of polygons to generate (e.g. 100, 500).
     output_path : str or Path, optional
         If given, save the resulting list as JSON to this path.
 
@@ -148,21 +147,16 @@ def generate_dataset(total_count, output_path=None):
     -------
     list[dict]
         All generated polygon records with sequential IDs starting from 1.
-
-    Example
-    -------
-    >>> polygons = generate_dataset(90, output_path="data/polygon_dataset_90.json")
-    >>> len(polygons)  # 90
     """
-    per_tier  = total_count // 3
-    remainder = total_count - per_tier * 3   # goes to easy
+    tiers = ("easy", "mid", "hard", "extreme")
+    per_tier = total_count // len(tiers)
+    remainder = total_count - per_tier * len(tiers)  # extra easy galleries
 
     generated = []
-    for difficulty, count in [
-        ("easy", per_tier + remainder),
-        ("mid",  per_tier),
-        ("hard", per_tier),
-    ]:
+    for difficulty in tiers:
+        count = per_tier + (remainder if difficulty == "easy" else 0)
+        if count == 0:
+            continue
         print(f"  Generating {count} {difficulty} polygons...")
         generated.extend(generate_polygons_with_holes(count, difficulty))
 

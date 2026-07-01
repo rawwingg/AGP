@@ -54,13 +54,15 @@ def _coverage_rings(coverage_polygon):
     return []
 
 
-def draw_polygon(ax, record):
+def draw_polygon(ax, record, guard_range=None):
     ax.clear()
 
     outer_points = record["outer_points"]
     holes = record["holes"]
     guards = record["guards"]
-    security = Security(record)
+    # Use stored range from dataset if present, else the caller's default.
+    radius = record.get("guard range", guard_range)
+    security = Security(record, radius)
 
     # outer gallery
     outer = Polygon(outer_points)
@@ -75,7 +77,7 @@ def draw_polygon(ax, record):
 
     # each guard's visibility coverage (semi-transparent so overlaps are visible)
     for gx, gy in guards:
-        coverage = security.get_area_coverage_of_guard(Guard(gx, gy))
+        coverage = security.get_area_coverage_of_guard(Guard(gx, gy), radius=radius)
         for ring in _coverage_rings(coverage):
             rx = [p[0] for p in ring]
             ry = [p[1] for p in ring]

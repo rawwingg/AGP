@@ -46,7 +46,7 @@ from gymnasium import spaces
 import shapely
 
 from security import Security, Guard
-from generate_polygon_dataset import generate_polygons_with_holes
+from generate_polygon_dataset import generate_dataset
 
 
 # ----------------------------------------------------------------------------
@@ -66,6 +66,7 @@ ENT_COEF = 0.0           # no extra entropy bonus
 EVAL_FREQ = 10_000       # every N steps, evaluate on the test set and keep the best model
 
 IMG_SIZE = 64            # observation is an IMG_SIZE x IMG_SIZE x 3 image fed to a CNN
+GUARD_RANGE = 200        # max visibility distance per guard (world units); None = unlimited
 GUARD_COST = 0.05        # penalty per guard placed (the "-guard" reward term)
 COVERAGE_THRESHOLD = 0.98  # episode ends successfully at >= this coverage
 MAX_GUARDS = 20          # hard cap on guards per episode (episode length limit)
@@ -106,11 +107,11 @@ TEST_PREVIEW_DIR = RUNS_DIR / "test_previews"  # PNGs of the agent's test soluti
 # Dataset generation
 # ----------------------------------------------------------------------------
 def generate_datasets(n_train=N_TRAIN, n_test=N_TEST):
-    """Generate train/test gallery datasets and return them as lists of dicts."""
-    print(f"Generating {n_train} training galleries -> {TRAIN_PATH}")
-    train = generate_polygons_with_holes(n_train, TRAIN_PATH)
-    print(f"Generating {n_test} test galleries -> {TEST_PATH}")
-    test = generate_polygons_with_holes(n_test, TEST_PATH)
+    """Generate train/test gallery datasets (mixed easy/mid/hard/extreme) and return them."""
+    print(f"Generating {n_train} training galleries (4 difficulty tiers) -> {TRAIN_PATH}")
+    train = generate_dataset(n_train, TRAIN_PATH)
+    print(f"Generating {n_test} test galleries (4 difficulty tiers) -> {TEST_PATH}")
+    test = generate_dataset(n_test, TEST_PATH)
     return train, test
 
 
@@ -132,7 +133,7 @@ class ArtGalleryEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, polygons, img_size=IMG_SIZE, guard_cost=GUARD_COST,
+    def __init__(self, polygons, img_size=IMG_SIZE, guard_range=GUARD_RANGE, guard_cost=GUARD_COST,
                  coverage_threshold=COVERAGE_THRESHOLD, max_guards=MAX_GUARDS,
                  invalid_penalty=INVALID_PENALTY, placement_bonus=PLACEMENT_BONUS,
                  redundant_penalty=REDUNDANT_PENALTY, min_guard_dist_frac=MIN_GUARD_DIST_FRAC,
@@ -141,6 +142,7 @@ class ArtGalleryEnv(gym.Env):
         super().__init__()
         self.polygons = polygons              # list of gallery dicts
         self.img_size = img_size
+        self.guard_range = guard_range        # max ray length for each guard's visibility
         self.guard_cost = guard_cost
         self.coverage_threshold = coverage_threshold
         self.max_guards = max_guards
@@ -224,7 +226,7 @@ class ArtGalleryEnv(gym.Env):
         record = self._select_polygon()
 
         # Fresh Security instance => zero guards, empty coverage.
-        self.security = Security(record)
+        self.security = Security(record, self.guard_range)
         self.perimeter_area = self.security.perimeter.area
         self.bounds = self.security.perimeter.bounds
         self.steps = 0
@@ -368,7 +370,7 @@ def _render_episode_figure(model, snapshot_env):
     record["area_coverage"] = info.get("coverage", 0.0)
 
     fig, ax = plt.subplots(figsize=(6, 6))
-    draw_polygon(ax, record)
+    draw_polygon(ax, record, guard_range=snapshot_env.guard_range)
     return fig, info
 
 
@@ -508,10 +510,11 @@ def test(save_previews=True):
         fig, ax = plt.subplots(figsize=(6, 6))
 
     print(f"\nEvaluating on {len(polygons)} test galleries:\n")
-    print(f"{'gallery':>8} | {'guards':>6} | {'coverage':>9}")
-    print("-" * 30)
+    print(f"{'gallery':>8} | {'diff':>8} | {'guards':>6} | {'coverage':>9}")
+    print("-" * 42)
 
     coverages, guard_counts = [], []
+    by_difficulty = {}
     for _ in range(len(polygons)):
         obs, _ = env.reset()
         done = False
@@ -524,21 +527,32 @@ def test(save_previews=True):
 
         record = env.polygons[(env._order_idx - 1) % len(env.polygons)]
         gallery_id = record["id"]
+        difficulty = record.get("difficulty", "?")
         coverages.append(info["coverage"])
         guard_counts.append(info["guards"])
-        print(f"{gallery_id:>8} | {info['guards']:>6} | {info['coverage'] * 100:>8.2f}%")
+        by_difficulty.setdefault(difficulty, {"coverage": [], "guards": []})
+        by_difficulty[difficulty]["coverage"].append(info["coverage"])
+        by_difficulty[difficulty]["guards"].append(info["guards"])
+        print(f"{gallery_id:>8} | {difficulty:>8} | {info['guards']:>6} | {info['coverage'] * 100:>8.2f}%")
 
         # Render this gallery with the guards the agent actually placed.
         if save_previews:
             preview = dict(record)
             preview["guards"] = list(env.security.all_guards.keys())
             preview["area_coverage"] = info["coverage"]
-            draw_polygon(ax, preview)
+            draw_polygon(ax, preview, guard_range=env.guard_range)
             out = TEST_PREVIEW_DIR / f"test_polygon_{gallery_id}.png"
             fig.savefig(out, dpi=110, bbox_inches="tight")
 
-    print("-" * 30)
-    print(f"{'avg':>8} | {np.mean(guard_counts):>6.1f} | {np.mean(coverages) * 100:>8.2f}%")
+    print("-" * 42)
+    print(f"{'avg':>8} | {'all':>8} | {np.mean(guard_counts):>6.1f} | {np.mean(coverages) * 100:>8.2f}%")
+    print("\nBy difficulty:")
+    for tier in ("easy", "mid", "hard", "extreme"):
+        if tier not in by_difficulty:
+            continue
+        d = by_difficulty[tier]
+        print(f"  {tier:>8}: {len(d['coverage']):>3} galleries | "
+              f"{np.mean(d['guards']):>4.1f} guards | {np.mean(d['coverage']) * 100:>6.2f}% coverage")
 
     if save_previews:
         plt.close(fig)
