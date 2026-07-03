@@ -61,15 +61,17 @@ SNAPSHOT_FREQ = 5_000    # every N steps, log a guard-placement image to TensorB
 # and late-training collapse; these keep each update small and well-behaved.
 LEARNING_RATE = 1e-4     # smaller steps than the 3e-4 default
 N_EPOCHS = 5             # fewer passes per rollout (default 10) -> less overfitting per update
-TARGET_KL = 0.03         # early-stop an update if the policy moves too far
-ENT_COEF = 0.0           # no extra entropy bonus
+TARGET_KL = 0.05         # early-stop an update if the policy moves too far (loosened so the
+                         # action std doesn't collapse and pin every guard to one spot)
+ENT_COEF = 0.01          # entropy bonus: keeps exploration alive so guards spread out
+                         # instead of stacking on the first "good" location the policy finds
 EVAL_FREQ = 10_000       # every N steps, evaluate on the test set and keep the best model
 
 IMG_SIZE = 64            # observation is an IMG_SIZE x IMG_SIZE x 3 image fed to a CNN
-GUARD_RANGE = 200        # max visibility distance per guard (world units); None = unlimited
+GUARD_RANGE = 100        # max visibility distance per guard (world units); None = unlimited
 GUARD_COST = 0.05        # penalty per guard placed (the "-guard" reward term)
-COVERAGE_THRESHOLD = 0.98  # episode ends successfully at >= this coverage
-MAX_GUARDS = 20          # hard cap on guards per episode (episode length limit)
+COVERAGE_THRESHOLD = 0.90  # episode ends successfully at >= this coverage (reachable on hard maps)
+MAX_GUARDS = 30          # hard cap on guards per episode (episode length limit)
 
 # Placement shaping: reward putting the guard in the "right area".
 # These guide the agent to aim INSIDE the gallery, at parts that still need covering.
@@ -79,18 +81,25 @@ PLACEMENT_BONUS = 0.05   # placed inside the gallery in a still-UNCOVERED spot -
 REDUNDANT_PENALTY = 0.05  # placed inside but in an ALREADY-COVERED spot -> wasted
 
 # Spacing: discourage placing guards too close together (clustering wastes guards).
-# The "too close" distance is a fraction of the gallery's bounding-box diagonal,
-# so it scales with each gallery's size instead of being a fixed pixel value.
-MIN_GUARD_DIST_FRAC = 0.15  # guards closer than 15% of the diagonal are "too close"
-CLOSE_PENALTY = 0.10        # penalty when a new guard is too close to an existing one
+# With LIMITED vision the relevant scale is the guard's range (two guards closer than a
+# fraction of their range have heavily overlapping coverage), so "too close" is a fraction
+# of GUARD_RANGE. If vision is unlimited we fall back to a fraction of the gallery diagonal.
+MIN_GUARD_DIST_FRAC = 0.60       # guards closer than 60% of the vision range are "too close"
+MIN_GUARD_DIST_FRAC_DIAG = 0.15  # fallback (unlimited vision): fraction of the diagonal
+CLOSE_PENALTY = 0.10             # penalty when a new guard is too close to an existing one
 
-# Early stop: if the agent keeps placing guards that add ~no new area, the episode is
-# stuck (e.g. re-placing on the same spot). End it instead of wasting the guard budget.
-# "Unproductive" is relative to what is STILL UNCOVERED: a guard must cover at least this
-# fraction of the remaining uncovered area to count as productive. This adapts as the
-# gallery fills up, instead of a fixed fraction of the whole gallery.
-USEFUL_AREA_FRAC = 0.10   # guard must cover >= 10% of the remaining uncovered area
-PATIENCE = 3              # end the episode after this many unproductive guards in a row
+# Completion: a one-off bonus when the episode ends by reaching COVERAGE_THRESHOLD. This
+# gives a strong, unambiguous signal for finishing the job (vs. just nibbling area).
+COMPLETION_BONUS = 1.0
+
+# Early stop: only meant to catch a guard that adds ~NOTHING (re-placed on the same spot
+# or fully inside already-covered area). The threshold is deliberately TINY so a guard
+# making small-but-real progress still counts as productive. Earlier this was 1% of total
+# area, which on hard/extreme maps flagged genuinely useful guards (each adding ~2-10%
+# would pass, but the policy's overlapping aims added <1%) and truncated episodes at 2-3
+# guards -- starving training of the long, high-coverage rollouts it needs to learn from.
+USEFUL_AREA_FRAC = 0.002  # guard adding < 0.2% of total area = "unproductive" (≈ redundant)
+PATIENCE = 5              # end the episode after this many unproductive guards in a row
 
 # File locations.
 # Datasets stay in the project, but training outputs are saved on Desktop/AGP so git/GitHub
@@ -137,7 +146,9 @@ class ArtGalleryEnv(gym.Env):
                  coverage_threshold=COVERAGE_THRESHOLD, max_guards=MAX_GUARDS,
                  invalid_penalty=INVALID_PENALTY, placement_bonus=PLACEMENT_BONUS,
                  redundant_penalty=REDUNDANT_PENALTY, min_guard_dist_frac=MIN_GUARD_DIST_FRAC,
-                 close_penalty=CLOSE_PENALTY, useful_area_frac=USEFUL_AREA_FRAC,
+                 min_guard_dist_frac_diag=MIN_GUARD_DIST_FRAC_DIAG,
+                 close_penalty=CLOSE_PENALTY, completion_bonus=COMPLETION_BONUS,
+                 useful_area_frac=USEFUL_AREA_FRAC,
                  patience=PATIENCE, random_reset=True):
         super().__init__()
         self.polygons = polygons              # list of gallery dicts
@@ -149,9 +160,11 @@ class ArtGalleryEnv(gym.Env):
         self.invalid_penalty = invalid_penalty      # wrong-area (outside) penalty
         self.placement_bonus = placement_bonus      # right-area (uncovered interior) bonus
         self.redundant_penalty = redundant_penalty  # already-covered placement penalty
-        self.min_guard_dist_frac = min_guard_dist_frac  # "too close" distance (frac of diagonal)
+        self.min_guard_dist_frac = min_guard_dist_frac  # "too close" distance (frac of vision range)
+        self.min_guard_dist_frac_diag = min_guard_dist_frac_diag  # fallback (frac of diagonal)
         self.close_penalty = close_penalty          # penalty for placing guards too close
-        self.useful_area_frac = useful_area_frac    # below this added-area frac = unproductive
+        self.completion_bonus = completion_bonus    # one-off bonus for reaching the threshold
+        self.useful_area_frac = useful_area_frac    # below this (frac of TOTAL area) = unproductive
         self.patience = patience                    # consecutive unproductive guards -> stop
         self.random_reset = random_reset      # True: random gallery; False: cycle in order
         self._order_idx = 0                   # used when random_reset is False (evaluation)
@@ -164,14 +177,19 @@ class ArtGalleryEnv(gym.Env):
         #     ch0 = inside the gallery   (the room the agent must cover)
         #     ch1 = already covered      (what guards can currently see)
         #     ch2 = remaining to cover   (inside AND not yet covered = the "right area")
-        #   stats (2,) float -- handled by an MLP; info the image cannot convey:
-        #     [coverage_fraction, budget_used_fraction]
-        # The image alone can't reveal how much guard budget is spent (the covered channel
-        # is a union, so 1 guard vs 3 guards covering the same area look identical), so we
-        # feed these scalars explicitly.
+        #   stats (4,) float -- handled by an MLP; info the image cannot (easily) convey:
+        #     [coverage_fraction, budget_used_fraction, remaining_centroid_x, _y]
+        # - coverage / budget: the image can't show how much guard budget is spent (the
+        #   covered channel is a union, so 1 vs 3 guards over the same area look identical).
+        # - remaining_centroid (x, y in [0,1] of the bounding box): the center of mass of the
+        #   still-uncovered pixels. This directly scaffolds the "aim at the remaining blob"
+        #   behaviour -- the policy only has to learn a small offset from this hint instead
+        #   of localizing the uncovered region from raw pixels. (It's a hint, not a command:
+        #   for a split/U-shaped remainder the centroid may sit in covered space, and the
+        #   policy is free to adjust; invalid aims are snapped inward anyway.)
         self.observation_space = spaces.Dict({
             "image": spaces.Box(low=0, high=255, shape=(img_size, img_size, 3), dtype=np.uint8),
-            "stats": spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32),
+            "stats": spaces.Box(low=0.0, high=1.0, shape=(4,), dtype=np.float32),
         })
 
         # Episode state (filled in by reset()).
@@ -208,7 +226,7 @@ class ArtGalleryEnv(gym.Env):
         self.covered_mask = np.zeros_like(self.inside_mask, dtype=bool)
 
     def _get_obs(self):
-        """Build the Dict observation: the (H, W, 3) image plus the (2,) stats vector."""
+        """Build the Dict observation: the (H, W, 3) image plus the (4,) stats vector."""
         remaining = self.inside_mask & (~self.covered_mask)
         img = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
         img[:, :, 0] = self.inside_mask.astype(np.uint8) * 255    # ch0: gallery interior
@@ -217,7 +235,18 @@ class ArtGalleryEnv(gym.Env):
 
         coverage = float(np.clip(self.security.percent_coverage, 0.0, 1.0))
         budget_used = float(np.clip(self.steps / self.max_guards, 0.0, 1.0))
-        stats = np.array([coverage, budget_used], dtype=np.float32)
+
+        # Center of mass of the still-uncovered pixels, normalized to [0, 1] of the grid.
+        # np.nonzero returns (row=y, col=x) indices; columns map to x, rows to y.
+        rem_rows, rem_cols = np.nonzero(remaining)
+        if rem_cols.size:
+            denom = max(self.img_size - 1, 1)
+            rem_cx = float(np.clip(rem_cols.mean() / denom, 0.0, 1.0))
+            rem_cy = float(np.clip(rem_rows.mean() / denom, 0.0, 1.0))
+        else:
+            rem_cx = rem_cy = 0.5   # nothing left to cover -> neutral hint
+
+        stats = np.array([coverage, budget_used, rem_cx, rem_cy], dtype=np.float32)
         return {"image": img, "stats": stats}
 
     # -- gym API -------------------------------------------------------------
@@ -233,10 +262,14 @@ class ArtGalleryEnv(gym.Env):
         self.unproductive_streak = 0
         self._build_grid()
 
-        # "Too close" distance for this gallery = fraction of its bounding-box diagonal.
-        minx, miny, maxx, maxy = self.bounds
-        diagonal = math.hypot(maxx - minx, maxy - miny)
-        self.min_guard_dist = self.min_guard_dist_frac * diagonal
+        # "Too close" distance. With limited vision it scales with the guard's range
+        # (overlapping fields of view); with unlimited vision we use the gallery diagonal.
+        if self.guard_range:
+            self.min_guard_dist = self.min_guard_dist_frac * self.guard_range
+        else:
+            minx, miny, maxx, maxy = self.bounds
+            diagonal = math.hypot(maxx - minx, maxy - miny)
+            self.min_guard_dist = self.min_guard_dist_frac_diag * diagonal
 
         return self._get_obs(), {}
 
@@ -280,20 +313,6 @@ class ArtGalleryEnv(gym.Env):
         x, y, was_invalid = self._snap_into_gallery(x, y)
         guard = Guard(x, y)
 
-        # --- Reward is built from clear, separate pieces (see docs/agp_ppo_design.md) ---
-        # Was this exact spot already covered BEFORE we place the new guard?
-        already_covered = self.security.coverage_areas.contains(guard.position)
-
-        # Distance to the closest existing guard (before this one is added).
-        too_close = False
-        if self.security.all_guards:
-            nearest = min(math.hypot(x - gx, y - gy)
-                          for gx, gy in self.security.all_guards.keys())
-            too_close = nearest < self.min_guard_dist
-
-        # Uncovered area BEFORE this guard, used for the relative productivity check.
-        uncovered_before = self.perimeter_area - self.security.coverage_areas.area
-
         # add_guard returns the NEW area this guard contributes (overlap removed).
         new_area = self.security.add_guard(guard)
 
@@ -304,27 +323,21 @@ class ArtGalleryEnv(gym.Env):
             newly = np.asarray(newly, dtype=bool).reshape(self.img_size, self.img_size)
             self.covered_mask |= newly
 
-        # 1) main term: fraction of newly covered area  (+ for new area)
-        area_term = new_area / self.perimeter_area
-        # 2) per-guard cost                              (- for each guard)
-        cost_term = self.guard_cost
-        # 3) placement shaping: reward the "right area", punish redundant spots
-        if already_covered:
-            placement_term = -self.redundant_penalty
-        else:
-            placement_term = self.placement_bonus
-        # 4) spacing: penalize a guard placed too close to an existing one
-        spacing_term = -self.close_penalty if too_close else 0.0
-        # 5) aim: penalize having aimed outside the gallery (guard was snapped inward)
-        invalid_term = -self.invalid_penalty if was_invalid else 0.0
+        # --- Reward: deliberately SIMPLE (see docs/agp_ppo_design.md) ---
+        # The only way to earn reward is to cover NEW area, minus a small per-guard cost.
+        # A guard stacked on an existing one adds ~0 new area, so it just costs -guard_cost;
+        # the only positive reward comes from moving to still-uncovered space. This pushes
+        # guards apart on its own, without extra spacing/placement shaping terms.
+        area_term = new_area / self.perimeter_area   # + for new area covered
+        cost_term = self.guard_cost                  # - for each guard placed
+        reward = area_term - cost_term
 
-        reward = area_term - cost_term + placement_term + spacing_term + invalid_term
-
-        # Track "unproductive" guards relative to what was still uncovered: the guard
-        # must cover >= USEFUL_AREA_FRAC of the remaining uncovered area to count as
-        # productive. A guard stacked on an existing one adds ~0 area, so it lands in the
-        # unproductive branch -- this is how we treat it as a no-op the agent avoids.
-        productive_threshold = self.useful_area_frac * uncovered_before
+        # Track "unproductive" guards with an ABSOLUTE threshold: the guard must add
+        # >= USEFUL_AREA_FRAC of the TOTAL gallery area to count as productive. A guard
+        # stacked on an existing one adds ~0 area, so it lands in the unproductive branch.
+        # (Absolute, not relative to remaining area, so limited-vision guards on big/complex
+        # galleries aren't unfairly flagged just because the remaining area is huge.)
+        productive_threshold = self.useful_area_frac * self.perimeter_area
         if new_area < productive_threshold:
             self.unproductive_streak += 1
         else:
@@ -332,6 +345,8 @@ class ArtGalleryEnv(gym.Env):
 
         coverage = self.security.percent_coverage
         terminated = coverage >= self.coverage_threshold   # covered enough -> success
+        if terminated:
+            reward += self.completion_bonus   # one-off bonus for finishing the job
         # End early if out of budget OR stuck placing unproductive guards repeatedly.
         out_of_budget = self.steps >= self.max_guards
         stuck = self.unproductive_streak >= self.patience
@@ -341,6 +356,7 @@ class ArtGalleryEnv(gym.Env):
             "coverage": coverage,
             "guards": len(self.security.all_guards),
             "stopped_early": bool(stuck and not out_of_budget),
+            "aimed_invalid": bool(was_invalid),
         }
         return self._get_obs(), float(reward), bool(terminated), bool(truncated), info
 
