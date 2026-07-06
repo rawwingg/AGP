@@ -46,7 +46,7 @@ from gymnasium import spaces
 import shapely
 
 from security import Security, Guard
-from generate_polygon_dataset import generate_polygons_with_holes
+from generate_polygon_dataset import generate_dataset
 
 
 # ----------------------------------------------------------------------------
@@ -94,9 +94,11 @@ PATIENCE = 3              # end the episode after this many unproductive guards 
 # File locations.
 # Datasets stay in the project, but training outputs are saved on Desktop/AGP so git/GitHub
 # Desktop refreshes cannot delete the model checkpoints or TensorBoard logs.
+# INFPPO branch uses its own subfolder so runs here never overwrite the PPO branch outputs
+# (~/Desktop/AGP/models, logs, test_previews).
 TRAIN_PATH = Path("Polygons") / "train_polygons.json"
 TEST_PATH = Path("Polygons") / "test_polygons.json"
-RUNS_DIR = Path.home() / "Desktop" / "AGP"
+RUNS_DIR = Path.home() / "Desktop" / "AGP" / "infppo model"
 MODEL_PATH = RUNS_DIR / "models" / "ppo_agp"     # SB3 appends .zip
 LOG_DIR = RUNS_DIR / "logs" / "ppo_agp"
 TEST_PREVIEW_DIR = RUNS_DIR / "test_previews"  # PNGs of the agent's test solutions
@@ -106,11 +108,11 @@ TEST_PREVIEW_DIR = RUNS_DIR / "test_previews"  # PNGs of the agent's test soluti
 # Dataset generation
 # ----------------------------------------------------------------------------
 def generate_datasets(n_train=N_TRAIN, n_test=N_TEST):
-    """Generate train/test gallery datasets and return them as lists of dicts."""
-    print(f"Generating {n_train} training galleries -> {TRAIN_PATH}")
-    train = generate_polygons_with_holes(n_train, TRAIN_PATH)
-    print(f"Generating {n_test} test galleries -> {TEST_PATH}")
-    test = generate_polygons_with_holes(n_test, TEST_PATH)
+    """Generate train/test gallery datasets (mixed easy/mid/hard/extreme) and return them."""
+    print(f"Generating {n_train} training galleries (4 difficulty tiers) -> {TRAIN_PATH}")
+    train = generate_dataset(n_train, TRAIN_PATH)
+    print(f"Generating {n_test} test galleries (4 difficulty tiers) -> {TEST_PATH}")
+    test = generate_dataset(n_test, TEST_PATH)
     return train, test
 
 
@@ -508,10 +510,11 @@ def test(save_previews=True):
         fig, ax = plt.subplots(figsize=(6, 6))
 
     print(f"\nEvaluating on {len(polygons)} test galleries:\n")
-    print(f"{'gallery':>8} | {'guards':>6} | {'coverage':>9}")
-    print("-" * 30)
+    print(f"{'gallery':>8} | {'diff':>8} | {'guards':>6} | {'coverage':>9}")
+    print("-" * 42)
 
     coverages, guard_counts = [], []
+    by_difficulty = {}
     for _ in range(len(polygons)):
         obs, _ = env.reset()
         done = False
@@ -524,9 +527,13 @@ def test(save_previews=True):
 
         record = env.polygons[(env._order_idx - 1) % len(env.polygons)]
         gallery_id = record["id"]
+        difficulty = record.get("difficulty", "?")
         coverages.append(info["coverage"])
         guard_counts.append(info["guards"])
-        print(f"{gallery_id:>8} | {info['guards']:>6} | {info['coverage'] * 100:>8.2f}%")
+        by_difficulty.setdefault(difficulty, {"coverage": [], "guards": []})
+        by_difficulty[difficulty]["coverage"].append(info["coverage"])
+        by_difficulty[difficulty]["guards"].append(info["guards"])
+        print(f"{gallery_id:>8} | {difficulty:>8} | {info['guards']:>6} | {info['coverage'] * 100:>8.2f}%")
 
         # Render this gallery with the guards the agent actually placed.
         if save_previews:
@@ -537,8 +544,15 @@ def test(save_previews=True):
             out = TEST_PREVIEW_DIR / f"test_polygon_{gallery_id}.png"
             fig.savefig(out, dpi=110, bbox_inches="tight")
 
-    print("-" * 30)
-    print(f"{'avg':>8} | {np.mean(guard_counts):>6.1f} | {np.mean(coverages) * 100:>8.2f}%")
+    print("-" * 42)
+    print(f"{'avg':>8} | {'all':>8} | {np.mean(guard_counts):>6.1f} | {np.mean(coverages) * 100:>8.2f}%")
+    print("\nBy difficulty:")
+    for tier in ("easy", "mid", "hard", "extreme"):
+        if tier not in by_difficulty:
+            continue
+        d = by_difficulty[tier]
+        print(f"  {tier:>8}: {len(d['coverage']):>3} galleries | "
+              f"{np.mean(d['guards']):>4.1f} guards | {np.mean(d['coverage']) * 100:>6.2f}% coverage")
 
     if save_previews:
         plt.close(fig)
