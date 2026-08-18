@@ -49,7 +49,7 @@ class Security:
         else:
             raise ValueError("Guard position is outside the polygon perimeter.")
 
-    def get_area_coverage_of_guard(self, guard):
+    def get_area_coverage_of_guard(self, guard, radius = None, deg = 2):
         if not self.perimeter.covers(guard.position):
             return Polygon()  # empty
 
@@ -80,49 +80,64 @@ class Security:
         angles = sorted(set(angles))
 
         hits = []
-        for angle in angles:
+        
+        for ang in angles:
             ex = x + math.cos(angle) * max_dist
             ey = y + math.sin(angle) * max_dist
             ray = LineString([guard.position, Point(ex, ey)])
 
-            # intersect with polygon boundary (prefer boundary for clean intersections)
-            inter = ray.intersection(self.perimeter.boundary)
+            angles_to_cast = [ang - eps, ang, ang + eps]
 
-            if inter.is_empty:
-                continue
+            current_hits = []
+            for angle in angles_to_cast:
+                ex = x + math.cos(angle) * max_dist
+                ey = y + math.sin(angle) * max_dist
 
-            # gather candidate points from intersection geometry
-            candidates = []
-            if inter.geom_type == "Point":
-                candidates.append((inter.x, inter.y))
-            elif inter.geom_type == "MultiPoint":
-                for g in inter.geoms:
-                    candidates.append((g.x, g.y))
-            elif inter.geom_type == "LineString":
-                candidates.extend(list(inter.coords))
-            elif inter.geom_type == "MultiLineString":
-                for g in inter.geoms:
-                    candidates.extend(list(g.coords))
-            else:
-                # fallback: try to iterate geoms if available
-                if hasattr(inter, "geoms"):
+                ray = LineString([guard.position, Point(ex, ey)])
+
+                # intersect with polygon boundary (prefer boundary for clean intersections)
+                inter = ray.intersection(self.perimeter.boundary)
+
+                if inter.is_empty:
+                    if Point(ex,ey).within(self.perimeter):
+                        hits.append((angle,(ex,ey)))
+                    else:
+                        continue
+
+                # gather candidate points from intersection geometry
+                candidates = []
+                if inter.geom_type == "Point":
+                    candidates.append((inter.x, inter.y))
+                elif inter.geom_type == "MultiPoint":
                     for g in inter.geoms:
-                        if getattr(g, "geom_type", "") == "Point":
-                            candidates.append((g.x, g.y))
-                        elif getattr(g, "geom_type", "") == "LineString":
-                            candidates.extend(list(g.coords))
+                        candidates.append((g.x, g.y))
+                elif inter.geom_type == "LineString":
+                    candidates.extend(list(inter.coords))
+                elif inter.geom_type == "MultiLineString":
+                    for g in inter.geoms:
+                        candidates.extend(list(g.coords))
+                else:
+                    # fallback: try to iterate geoms if available
+                    if hasattr(inter, "geoms"):
+                        for g in inter.geoms:
+                            if getattr(g, "geom_type", "") == "Point":
+                                candidates.append((g.x, g.y))
+                            elif getattr(g, "geom_type", "") == "LineString":
+                                candidates.extend(list(g.coords))
 
-            # pick the closest candidate to the guard along this ray
-            best = None
-            bestd = float("inf")
-            for cx, cy in candidates:
-                d = (cx - x) ** 2 + (cy - y) ** 2
-                if d < bestd:
-                    bestd = d
-                    best = (cx, cy)
+                # pick the closest candidate to the guard along this ray
+                best = None
+                bestd = float("inf")
+                for cx, cy in candidates:
+                    d = ((cx - x) ** 2 + (cy - y) ** 2) ** 0.5
+                    if d < bestd:
+                        bestd = d
+                        best = (cx, cy)
 
-            if best is not None:
-                hits.append((angle, best))
+                if best is not None:
+                    current_hits.append((angle, best))
+
+            hits.extend(current_hits)
 
         if not hits:
             return Polygon()
@@ -131,22 +146,29 @@ class Security:
         hits.sort(key=lambda t: t[0])
         coords = []
         seen = set()
+        last_hit = None
         for _angle, (px, py) in hits:
             key = (round(px, 8), round(py, 8))
             if key in seen:
                 continue
             seen.add(key)
-            coords.append((px, py))
+
+            coords.append((px, py)) 
 
         # must have at least 3 points for a polygon
+
         if len(coords) < 3:
             return Polygon()
 
         new_poly = Polygon(coords)
+
+        new_poly = new_poly.simplify(0.2, preserve_topology=True)
         if not new_poly.is_valid:
             new_poly = make_valid(new_poly)
 
         # clip to the perimeter to be safe
+
+        clipped = new_poly
         try:
             clipped = new_poly.intersection(self.perimeter)
         except Exception:
@@ -220,4 +242,4 @@ def sort_points_clockwise(points, centre):
     return sorted_points
 
 if __name__ == "__main__":
-    new_dataset_with_guards(min_guards_per_polygon=1, max_guards_per_polygon=3)
+    new_dataset_with_guards(min_guards_per_polygon=1, max_guards_per_polygon=1, radius = None)

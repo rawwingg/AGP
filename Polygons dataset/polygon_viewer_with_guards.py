@@ -22,6 +22,7 @@ class GuardedPolygonViewer(tk.Tk):
         self.data_path = Path(data_path)
         self.polygons = self.load_polygons()
         self.selected_index = 0
+        self.tipwindow = None
 
         self.configure(bg="#f3f4f6")
         self.create_styles()
@@ -187,7 +188,6 @@ class GuardedPolygonViewer(tk.Tk):
             guard_obj = Guard(guard[0], guard[1])
             # draw guard point
             gx, gy = self.scale_points([guard], all_points)[0:2]
-            self.draw_point(gx, gy,size=10, color="black")
 
             coverage_polygon = security.get_area_coverage_of_guard(guard_obj)
             if coverage_polygon is None or coverage_polygon.is_empty:
@@ -216,9 +216,41 @@ class GuardedPolygonViewer(tk.Tk):
                 width=2,
                 stipple="gray50"
             )
-    def draw_point(self, x, y, size = 5, color="black"):
+
+            for coord in range(0, len(scaled_coverage), 2):
+                self.canvas.create_line(gx, gy, scaled_coverage[coord], scaled_coverage[coord + 1], fill="orange", width=1, dash=(2, 4))
+                self.draw_point(scaled_coverage[coord], scaled_coverage[coord + 1], size=4, color="red")
+
+            self.draw_point(gx, gy,size=10, color="black")
+
+    def draw_point(self, x, y, size = 2, color="black"):
         # Coordinates define a 1x1 bounding box
-        self.canvas.create_oval(x-(size/2), y-(size/2), x + (size/2), y + (size/2), fill=color, outline=color)
+        dot = self.canvas.create_oval(x-(size/2), y-(size/2), x + (size/2), y + (size/2), fill=color, outline=color)
+
+        self.canvas.tag_raise(dot)  # Ensure the dot is on top of other elements
+        self.canvas.tag_bind(dot, "<Enter>", self.show_tip)
+        self.canvas.tag_bind(dot, "<Leave>", self.hide_tip)
+        return dot
+
+    def show_tip(self, event=None):
+        if self.tipwindow is not None:
+            return
+        
+        x = self.canvas.winfo_rootx() + event.x + 10
+        y = self.canvas.winfo_rooty() + event.y + 10
+        
+        self.tipwindow = tw = tk.Toplevel(self.canvas)
+        tw.wm_overrideredirect(True) # Remove window borders
+        tw.wm_attributes("-topmost", True) # Keep the tooltip on top
+        tw.wm_geometry(f"+{x}+{y}")
+        
+        label = tk.Label(tw, text= "(" + str(event.x) + ", " + str(event.y) + ")", background="#ffffe0", relief='solid', borderwidth=1, font=("tahoma", "8", "normal"))
+        label.pack()
+
+    def hide_tip(self, event=None):
+        if self.tipwindow is not None:
+            self.tipwindow.destroy()
+            self.tipwindow = None
 
     def scale_points(self, points, all_points): # 
         canvas_width = max(self.canvas.winfo_width(), 1)
