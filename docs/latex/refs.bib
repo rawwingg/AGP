@@ -1,0 +1,355 @@
+% ===========================================================================
+% Shared bibliography for the AGP MDP / staged-PPO design notes.
+% Local copies of the three locomotion papers live in references/locomotion/.
+% ===========================================================================
+
+% ---------------------------------------------------------------------------
+% The three locomotion / whole-body-control papers used as design inspiration
+% ---------------------------------------------------------------------------
+@article{wang2025dribble,
+  title        = {Dribble Master: Learning Agile Humanoid Dribbling Through Legged Locomotion},
+  author       = {Wang, Zhuoheng and Zhou, Jinyin and Wu, Qi},
+  journal      = {arXiv preprint arXiv:2505.12679},
+  year         = {2025},
+  eprint       = {2505.12679},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.RO},
+  url          = {https://arxiv.org/abs/2505.12679}
+}
+
+@article{wang2025vision,
+  title        = {Learning Vision-Driven Reactive Soccer Skills for Humanoid Robots},
+  author       = {Wang, Yushi and Luo, Changsheng and Chen, Penghui and Liu, Jianran
+                  and Sun, Weijian and Guo, Tong and Yang, Kechang and Hu, Biao
+                  and Zhang, Yangang and Zhao, Mingguo},
+  journal      = {arXiv preprint arXiv:2511.03996},
+  year         = {2025},
+  eprint       = {2511.03996},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.RO},
+  url          = {https://arxiv.org/abs/2511.03996}
+}
+
+@article{xu2025striker,
+  title        = {Learning Agile Striker Skills for Humanoid Soccer Robots from Noisy Sensory Input},
+  author       = {Xu, Zifan and Seo, Myoungkyu and Lee, Dongmyeong and Fu, Hao and Hu, Jiaheng
+                  and Cui, Jiaxun and Jiang, Yuqian and Wang, Zhihan and Brund, Anastasiia
+                  and Biswas, Joydeep and Stone, Peter},
+  journal      = {arXiv preprint arXiv:2512.06571},
+  year         = {2025},
+  note         = {Version 3, May 2026},
+  eprint       = {2512.06571},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.RO},
+  url          = {https://arxiv.org/abs/2512.06571}
+}
+
+@article{chen2025hifar,
+  title        = {HiFAR: Multi-Stage Curriculum Learning for High-Dynamics Humanoid Fall Recovery},
+  author       = {Chen, Penghui and Wang, Yushi and Luo, Changsheng and Cai, Ruiqi and Zhao, Mingguo},
+  journal      = {arXiv preprint arXiv:2502.20061},
+  year         = {2025},
+  eprint       = {2502.20061},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.RO},
+  url          = {https://arxiv.org/abs/2502.20061}
+}
+
+% ---------------------------------------------------------------------------
+% Art Gallery Problem: theory and exact / approximate algorithms
+% ---------------------------------------------------------------------------
+@article{chvatal1975,
+  title   = {A combinatorial theorem in plane geometry},
+  author  = {Chv{\'a}tal, V{\'a}clav},
+  journal = {Journal of Combinatorial Theory, Series B},
+  volume  = {18},
+  number  = {1},
+  pages   = {39--41},
+  year    = {1975}
+}
+
+@article{fisk1978,
+  title   = {A short proof of Chv{\'a}tal's watchman theorem},
+  author  = {Fisk, Steve},
+  journal = {Journal of Combinatorial Theory, Series B},
+  volume  = {24},
+  number  = {3},
+  pages   = {374},
+  year    = {1978}
+}
+
+@article{leelin1986,
+  title   = {Computational complexity of art gallery problems},
+  author  = {Lee, D. T. and Lin, Arthur K.},
+  journal = {IEEE Transactions on Information Theory},
+  volume  = {32},
+  number  = {2},
+  pages   = {276--282},
+  year    = {1986}
+}
+
+@book{orourke1987,
+  title     = {Art Gallery Theorems and Algorithms},
+  author    = {O'Rourke, Joseph},
+  publisher = {Oxford University Press},
+  year      = {1987}
+}
+
+@article{eidenbenz2001,
+  title   = {Inapproximability results for guarding polygons and terrains},
+  author  = {Eidenbenz, Stephan and Stamm, Christoph and Widmayer, Peter},
+  journal = {Algorithmica},
+  volume  = {31},
+  number  = {1},
+  pages   = {79--113},
+  year    = {2001}
+}
+
+@inproceedings{abrahamsen2018,
+  title     = {The art gallery problem is $\exists\mathbb{R}$-complete},
+  author    = {Abrahamsen, Mikkel and Adamaszek, Anna and Miltzow, Tillmann},
+  booktitle = {Proceedings of the 50th Annual ACM SIGACT Symposium on Theory of Computing (STOC)},
+  pages     = {65--73},
+  year      = {2018}
+}
+
+@article{ghosh2010,
+  title   = {Approximation algorithms for art gallery problems in polygons},
+  author  = {Ghosh, Subir Kumar},
+  journal = {Discrete Applied Mathematics},
+  volume  = {158},
+  number  = {6},
+  pages   = {718--722},
+  year    = {2010}
+}
+
+@article{tozoni2016,
+  title   = {The quest for optimal solutions of the art gallery problem: A practical iterative algorithm},
+  author  = {Tozoni, Davi C. and de Rezende, Pedro J. and de Souza, Cid C.},
+  journal = {ACM Journal of Experimental Algorithmics},
+  volume  = {21},
+  pages   = {1--23},
+  year    = {2016}
+}
+
+@article{couto2011,
+  title   = {An exact algorithm for minimizing vertex guards on art galleries},
+  author  = {Couto, Marcelo C. and de Rezende, Pedro J. and de Souza, Cid C.},
+  journal = {International Transactions in Operational Research},
+  volume  = {18},
+  number  = {4},
+  pages   = {425--448},
+  year    = {2011}
+}
+
+% ---------------------------------------------------------------------------
+% Submodularity / set cover
+% ---------------------------------------------------------------------------
+@article{nemhauser1978,
+  title   = {An analysis of approximations for maximizing submodular set functions---I},
+  author  = {Nemhauser, George L. and Wolsey, Laurence A. and Fisher, Marshall L.},
+  journal = {Mathematical Programming},
+  volume  = {14},
+  number  = {1},
+  pages   = {265--294},
+  year    = {1978}
+}
+
+@article{feige1998,
+  title   = {A threshold of $\ln n$ for approximating set cover},
+  author  = {Feige, Uriel},
+  journal = {Journal of the ACM},
+  volume  = {45},
+  number  = {4},
+  pages   = {634--652},
+  year    = {1998}
+}
+
+% ---------------------------------------------------------------------------
+% Reinforcement learning: algorithms and theory
+% ---------------------------------------------------------------------------
+@article{schulman2017ppo,
+  title   = {Proximal Policy Optimization Algorithms},
+  author  = {Schulman, John and Wolski, Filip and Dhariwal, Prafulla and Radford, Alec and Klimov, Oleg},
+  journal = {arXiv preprint arXiv:1707.06347},
+  year    = {2017},
+  url     = {https://arxiv.org/abs/1707.06347}
+}
+
+@inproceedings{schulman2016gae,
+  title     = {High-Dimensional Continuous Control Using Generalized Advantage Estimation},
+  author    = {Schulman, John and Moritz, Philipp and Levine, Sergey and Jordan, Michael and Abbeel, Pieter},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2016}
+}
+
+@inproceedings{ng1999,
+  title     = {Policy invariance under reward transformations: Theory and application to reward shaping},
+  author    = {Ng, Andrew Y. and Harada, Daishi and Russell, Stuart},
+  booktitle = {Proceedings of the 16th International Conference on Machine Learning (ICML)},
+  pages     = {278--287},
+  year      = {1999}
+}
+
+@book{sutton2018,
+  title     = {Reinforcement Learning: An Introduction},
+  author    = {Sutton, Richard S. and Barto, Andrew G.},
+  edition   = {2nd},
+  publisher = {MIT Press},
+  year      = {2018}
+}
+
+@book{altman1999,
+  title     = {Constrained Markov Decision Processes},
+  author    = {Altman, Eitan},
+  publisher = {Chapman and Hall/CRC},
+  year      = {1999}
+}
+
+@inproceedings{achiam2017cpo,
+  title     = {Constrained Policy Optimization},
+  author    = {Achiam, Joshua and Held, David and Tamar, Aviv and Abbeel, Pieter},
+  booktitle = {Proceedings of the 34th International Conference on Machine Learning (ICML)},
+  pages     = {22--31},
+  year      = {2017}
+}
+
+@article{lee2023constrained,
+  title        = {Evaluation of Constrained Reinforcement Learning Algorithms for Legged Locomotion},
+  author       = {Lee, Joonho and Schroth, Lukas and Klemm, Victor and Bjelonic, Marko
+                  and Reske, Alexander and Hutter, Marco},
+  journal      = {arXiv preprint arXiv:2309.15430},
+  year         = {2023},
+  eprint       = {2309.15430},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.RO},
+  url          = {https://arxiv.org/abs/2309.15430}
+}
+
+@inproceedings{pinto2018asymmetric,
+  title     = {Asymmetric Actor Critic for Image-Based Robot Learning},
+  author    = {Pinto, Lerrel and Andrychowicz, Marcin and Welinder, Peter and Zaremba, Wojciech and Abbeel, Pieter},
+  booktitle = {Robotics: Science and Systems (RSS)},
+  year      = {2018}
+}
+
+@inproceedings{ross2011dagger,
+  title     = {A reduction of imitation learning and structured prediction to no-regret online learning},
+  author    = {Ross, St{\'e}phane and Gordon, Geoffrey and Bagnell, Drew},
+  booktitle = {Proceedings of the 14th International Conference on Artificial Intelligence and Statistics (AISTATS)},
+  pages     = {627--635},
+  year      = {2011}
+}
+
+@article{peng2021amp,
+  title   = {AMP: Adversarial Motion Priors for Stylized Physics-Based Character Control},
+  author  = {Peng, Xue Bin and Ma, Ze and Abbeel, Pieter and Levine, Sergey and Kanazawa, Angjoo},
+  journal = {ACM Transactions on Graphics},
+  volume  = {40},
+  number  = {4},
+  pages   = {1--20},
+  year    = {2021}
+}
+
+@inproceedings{rudin2022,
+  title     = {Learning to Walk in Minutes Using Massively Parallel Deep Reinforcement Learning},
+  author    = {Rudin, Nikita and Hoeller, David and Reist, Philipp and Hutter, Marco},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  pages     = {91--100},
+  year      = {2022}
+}
+
+@inproceedings{bengio2009curriculum,
+  title     = {Curriculum learning},
+  author    = {Bengio, Yoshua and Louradour, J{\'e}r{\^o}me and Collobert, Ronan and Weston, Jason},
+  booktitle = {Proceedings of the 26th International Conference on Machine Learning (ICML)},
+  pages     = {41--48},
+  year      = {2009}
+}
+
+@article{narvekar2020curriculum,
+  title   = {Curriculum learning for reinforcement learning domains: A framework and survey},
+  author  = {Narvekar, Sanmit and Peng, Bei and Leonetti, Matteo and Sinapov, Jivko
+             and Taylor, Matthew E. and Stone, Peter},
+  journal = {Journal of Machine Learning Research},
+  volume  = {21},
+  number  = {181},
+  pages   = {1--50},
+  year    = {2020}
+}
+
+@article{chou2017beta,
+  title   = {Improving Stochastic Policy Gradients in Continuous Control with Deep Reinforcement Learning using the Beta Distribution},
+  author  = {Chou, Po-Wei and Maturana, Daniel and Scherer, Sebastian},
+  journal = {Proceedings of the 34th International Conference on Machine Learning (ICML)},
+  pages   = {834--843},
+  year    = {2017}
+}
+
+@article{hallak2015contextual,
+  title   = {Contextual Markov Decision Processes},
+  author  = {Hallak, Assaf and Di Castro, Dotan and Mannor, Shie},
+  journal = {arXiv preprint arXiv:1502.02259},
+  year    = {2015},
+  url     = {https://arxiv.org/abs/1502.02259}
+}
+
+@article{kaelbling1998pomdp,
+  title   = {Planning and acting in partially observable stochastic domains},
+  author  = {Kaelbling, Leslie Pack and Littman, Michael L. and Cassandra, Anthony R.},
+  journal = {Artificial Intelligence},
+  volume  = {101},
+  number  = {1--2},
+  pages   = {99--134},
+  year    = {1998}
+}
+
+% ---------------------------------------------------------------------------
+% Neural combinatorial optimisation
+% ---------------------------------------------------------------------------
+@inproceedings{vinyals2015pointer,
+  title     = {Pointer Networks},
+  author    = {Vinyals, Oriol and Fortunato, Meire and Jaitly, Navdeep},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2015}
+}
+
+@inproceedings{kool2019attention,
+  title     = {Attention, Learn to Solve Routing Problems!},
+  author    = {Kool, Wouter and van Hoof, Herke and Welling, Max},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2019}
+}
+
+@article{mazyavkina2021,
+  title   = {Reinforcement learning for combinatorial optimization: A survey},
+  author  = {Mazyavkina, Nina and Sviridov, Sergey and Ivanov, Sergei and Burnaev, Evgeny},
+  journal = {Computers \& Operations Research},
+  volume  = {134},
+  pages   = {105400},
+  year    = {2021}
+}
+
+% ---------------------------------------------------------------------------
+% Software
+% ---------------------------------------------------------------------------
+@article{raffin2021sb3,
+  title   = {Stable-Baselines3: Reliable Reinforcement Learning Implementations},
+  author  = {Raffin, Antonin and Hill, Ashley and Gleave, Adam and Kanervisto, Anssi
+             and Ernestus, Maximilian and Dormann, Noah},
+  journal = {Journal of Machine Learning Research},
+  volume  = {22},
+  number  = {268},
+  pages   = {1--8},
+  year    = {2021}
+}
+
+@article{towers2024gymnasium,
+  title   = {Gymnasium: A Standard Interface for Reinforcement Learning Environments},
+  author  = {Towers, Mark and Kwiatkowski, Ariel and Terry, Jordan and Balis, John U.
+             and De Cola, Gianluca and Deleu, Tristan and Goul{\~a}o, Manuel
+             and Kallinteris, Andreas and Krimmel, Markus and KG, Arjun and others},
+  journal = {arXiv preprint arXiv:2407.17032},
+  year    = {2024},
+  url     = {https://arxiv.org/abs/2407.17032}
+}

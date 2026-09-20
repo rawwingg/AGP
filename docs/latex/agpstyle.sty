@@ -1,0 +1,101 @@
+% agpstyle.sty -- shared preamble for the AGP MDP / curriculum notes.
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{agpstyle}[2026/09/20 Shared style for AGP RL design notes]
+
+\RequirePackage[T1]{fontenc}
+\RequirePackage{lmodern}
+\RequirePackage{microtype}
+\RequirePackage[margin=1in]{geometry}
+\RequirePackage{amsmath,amssymb,amsthm,mathtools}
+\RequirePackage{booktabs,tabularx,array,multirow}
+\RequirePackage{longtable}
+\RequirePackage[table]{xcolor}
+\RequirePackage{enumitem}
+\RequirePackage{caption}
+\RequirePackage{tikz}
+\RequirePackage{algorithm}
+\RequirePackage{algpseudocode}
+\RequirePackage[numbers,sort&compress]{natbib}
+\RequirePackage[colorlinks=true,linkcolor=agpblue,citecolor=agpblue,urlcolor=agpblue]{hyperref}
+\RequirePackage[nameinlink]{cleveref}
+
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc,decorations.pathreplacing}
+
+\definecolor{agpblue}{HTML}{1F4E79}
+\definecolor{agpaccent}{HTML}{B2560D}
+\definecolor{agpgrey}{HTML}{F2F2F2}
+\definecolor{agpgreen}{HTML}{2E6B4F}
+
+\captionsetup{font=small,labelfont={bf,color=agpblue}}
+\setlist{itemsep=2pt,topsep=3pt,parsep=0pt}
+
+% Long \code{...} tokens and dense inline maths would otherwise overflow the margin.
+\setlength{\emergencystretch}{3em}
+\sloppy
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{designrule}[theorem]{Design rule}
+
+% ---------------------------------------------------------------------------
+% Geometry / AGP notation
+% ---------------------------------------------------------------------------
+\newcommand{\Gallery}{G}                       % a gallery instance
+\newcommand{\Poly}{P}                          % outer polygon
+\newcommand{\Holes}{\mathcal{H}}               % set of holes
+\newcommand{\Free}{\mathcal{F}}                % free space
+\newcommand{\Area}[1]{\lvert #1 \rvert}        % Lebesgue area
+\newcommand{\Vis}{\mathcal{V}}                 % visibility polygon operator
+\newcommand{\Guards}{\mathcal{G}}              % guard set
+\newcommand{\Cov}{\mathcal{C}}                 % covered region
+\newcommand{\Unc}{\mathcal{U}}                 % uncovered region
+\newcommand{\proj}{\Pi_{\Free}}                % projection onto the free space
+\newcommand{\dbd}{d_{\partial}}                % distance to boundary
+\newcommand{\Reflex}{\mathcal{R}}              % reflex vertices
+
+% ---------------------------------------------------------------------------
+% MDP notation
+% ---------------------------------------------------------------------------
+\newcommand{\Sspace}{\mathcal{S}}
+\newcommand{\Aspace}{\mathcal{A}}
+\newcommand{\Ospace}{\Omega}
+\newcommand{\Tkernel}{\mathcal{T}}
+\newcommand{\Rfun}{\mathcal{R}}
+\newcommand{\Dctx}{\mathcal{D}}                % distribution over instances
+\newcommand{\Mdp}{\mathfrak{M}}
+\newcommand{\Pot}{\Phi}
+\newcommand{\Adv}{A}
+\newcommand{\Ex}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\Ind}[1]{\mathbf{1}\!\left[#1\right]}
+\newcommand{\Real}{\mathbb{R}}
+\newcommand{\ADD}{\textsc{Add}}
+\newcommand{\DEL}{\textsc{Del}}
+\newcommand{\STOP}{\textsc{Stop}}
+\newcommand{\MOVE}{\textsc{Move}}
+
+% Stage labels
+\newcommand{\stageI}{\textsc{Saturate}}
+\newcommand{\stageII}{\textsc{Prune}}
+\newcommand{\stageIII}{\textsc{Refine}}
+
+% Inline code
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+% A boxed "takeaway" note
+\newcommand{\takeaway}[1]{%
+  \par\vspace{4pt}%
+  \noindent\fcolorbox{agpblue}{agpgrey}{%
+    \begin{minipage}{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}
+      \small #1
+    \end{minipage}}%
+  \par\vspace{4pt}%
+}
+
+\endinput

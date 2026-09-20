@@ -15,16 +15,24 @@ env/
 .env
 .env.*
 
-# Generated polygon outputs
-Polygons/
-Polygons dataset/local_dataset*.json
-Polygons dataset/*.png
-polygon_test.png
-
-# PPO training outputs
-logs/
-models/
+# Generated datasets, training runs and checkpoints
+data/
+runs/
+previews/
 *.zip
+
+# LaTeX build intermediates (the .pdf outputs are committed)
+*.aux
+*.bbl
+*.blg
+*.out
+*.toc
+*.xdv
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+docs/latex/*.log
+docs/latex/*.pdf
 
 # Editor/OS noise
 .vscode/

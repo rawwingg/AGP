@@ -1,0 +1,929 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{agpstyle}
+
+\title{\bfseries A Three-Stage PPO Curriculum for the\\ Continuous Art Gallery Problem\\[4pt]
+\large Document 2 of 2: \stageI{} $\rightarrow$ \stageII{} $\rightarrow$ \stageIII{}}
+\author{AGP Project --- Design Note}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Document 1 defined a single MDP for the Art Gallery Problem in which coverage and guard
+parsimony enter as two potential-based reward components. This document specifies the
+training curriculum on top of it. Stage~\stageI{} (\stageI{}) switches the guard cost off
+entirely and asks only for coverage, with a boundary-inward placement prior that is
+annealed away; the policy learns to fill the gallery, deliberately over-completely.
+Stage~\stageII{} (\stageII{}) unmasks a delete action, switches the guard cost on, and pays
+a bounded bonus for every removal that costs no coverage, decaying smoothly as coverage is
+lost. Stage~\stageIII{} (\stageIII{}) replaces the fixed regularity penalties with
+state-wise constraints and polishes on the hardest instances. The design borrows four
+specific devices from the humanoid locomotion literature --- one reward basis with a
+per-stage weight column, a task objective held at exactly zero weight until its
+prerequisite is learned, scaffolding terms deleted rather than decayed, and multi-critic
+advantage weighting --- and contributes three things those papers do not provide: a
+quantitative stage-transition gate, a blended switch with a shadow-trained parsimony critic,
+and a cheap privileged \emph{prune oracle} that can warm-start the delete action by
+imitation. We give the full weight schedule, PPO hyperparameters per stage, network
+architecture, the instance-difficulty curriculum, an ablation protocol, and a concrete
+implementation roadmap against the existing code.
+\end{abstract}
+
+\tableofcontents
+
+% ===========================================================================
+\section{Why stage the training at all}
+% ===========================================================================
+
+\subsection{The conflict}
+
+The AGP objective has two parts that pull against each other during \emph{learning}, though
+not at the optimum. Coverage is easy to improve from a random start --- almost any guard
+placed in an empty gallery captures a large fraction of the area --- and its gradient is
+dense and informative. Parsimony is the opposite: a guard-count penalty is meaningful only
+once the agent can reliably cover the gallery, because before that point the cheapest way
+to reduce the guard count is to stop placing guards, which also destroys coverage. Turning
+both on from step zero means the agent must discover, from a random policy, that the
+\emph{only} route to a high return runs through a temporarily expensive regime.
+
+This is the same structure \citet{wang2025dribble} describe for humanoid dribbling:
+
+\begin{quote}\small
+``Training a humanoid robot to dribble presents a fundamental challenge: the rewards
+associated with walking and dribbling often conflict and are difficult to balance. Walking
+requires the robot to maintain stability and move efficiently, while dribbling demands
+agility and precise ball control. This trade-off complicates the simultaneous optimization
+of both skills.''
+\end{quote}
+
+\noindent
+Their ablation quantifies the cost of ignoring it: a single-stage policy reaches $33.0\%$
+success on dribble-to-target and $0\%$ on obstacle avoidance, against $86.7\%$ and $92.3\%$
+for the two-stage curriculum. The failure mode they report --- ``one-stage training policy
+can't stably walk and control the ball simultaneously, as both capabilities are learned
+jointly from scratch'' --- is exactly the failure mode we expect from an AGP policy trained
+with the guard cost on from the beginning.
+
+\subsection{What the three reference papers actually do}
+
+\Cref{tab:papers} summarises the three papers, with an eye to what is reusable.
+
+\begin{table}[t]
+\centering
+\small
+\caption{The three locomotion references, compared on the dimensions that matter here.
+Local copies are in \code{references/locomotion/}.}
+\label{tab:papers}
+\begin{tabularx}{\linewidth}{@{}p{2.5cm} p{2.1cm} X p{2.5cm}@{}}
+\toprule
+\textbf{Paper} & \textbf{Stages} & \textbf{What changes at a stage boundary} & \textbf{Transition trigger} \\
+\midrule
+Dribble Master \cite{wang2025dribble}
+& 2
+& Task reward $0.0 \to 1.5$; approach proxy $2.0 \to 1.0$; imitation scaffold $1.2 \to 0.0$;
+  ball spawn $10$\,m $\to 2$\,m; camera FOV $2\times \to 1\times$ real
+& Qualitative only: ``once the robot consistently demonstrates reliable locomotion'' \\
+\addlinespace
+Vision-driven soccer \cite{wang2025vision}
+& 1 (explicitly single-stage)
+& --- (no curriculum; uses potential-based shaping and a multi-critic split instead)
+& n/a \\
+\addlinespace
+Agile striker \cite{xu2025striker}
+& 4
+& Task reward $0.0 \to 4.0$; tracking proxy $2.0 \to 0.5$; gait scaffolds $3.0/1.0 \to 0.0$;
+  conflicting regulariser (feet yaw) $-1.0 \to 0.0$; spawn annulus $[0.5,4]\to[0.5,2]$\,m;
+  then DAgger distillation; then constrained online RL
+& Qualitative only: ``once the teacher policy acquires a basic kicking skill'' \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Four patterns are worth importing wholesale.
+
+\begin{enumerate}[label=\textbf{P\arabic*.},leftmargin=2.7em]
+  \item \textbf{One reward basis, one weight column per stage.} Neither multi-stage paper
+        changes the observation space, the action space or the reward \emph{terms} between
+        stages --- only the coefficients (and the initial-state distribution). We adopt this
+        exactly: \cref{tab:schedule} is the entire curriculum.
+  \item \textbf{The objective you cannot yet optimise gets weight zero, not a small weight.}
+        Dribble Master holds ball-velocity tracking at $0.0$ through stage 1;
+        the striker paper holds its ball-velocity reward at $0.0$ through stage 1. Neither
+        uses a small-but-nonzero coefficient. Our guard cost is therefore \emph{exactly}
+        $0$ in \stageI{} --- which is also what was asked for in the project brief.
+  \item \textbf{Scaffolds are deleted; proxies are demoted.} Both papers zero their
+        imitation/gait scaffolding at the boundary (Dribble Master: reference joint
+        position $1.2 \to 0.0$, ``removed to promote exploration and discovery of effective
+        dribbling behaviors''; striker: feet swing $3.0 \to 0.0$, arm swing $1.0 \to 0.0$),
+        but keep the stage-1 proxy alive at a reduced weight ($2.0 \to 1.0$ and
+        $2.0 \to 0.5$ respectively) rather than removing it, as insurance against
+        catastrophic forgetting. Document~1's \emph{anneal-iff-non-potential} rule explains \emph{why} this
+        split is the right one: scaffolds are non-potential and bias the optimum, proxies
+        closer to the objective do not.
+  \item \textbf{Split the critic before you split the reward.}
+        \citet{wang2025vision} found that ``using a single critic to estimate combined
+        rewards can cause negative interference between distinct reward components,'' and
+        use $\Adv_{\mathrm{total}} = 2\Adv_{\mathrm{goal}} + 1\cdot\Adv_{\mathrm{aux}}$. Our
+        coverage and parsimony rewards differ by more than an order of magnitude in scale
+        and by a factor of $\sim\!30$ in per-step variance, so this applies with force.
+\end{enumerate}
+
+\subsection{What we have to design ourselves}
+
+None of the three papers gives a quantitative criterion for advancing a stage. Dribble
+Master says ``once the robot consistently demonstrates reliable locomotion and target
+pursuit''; the striker paper says ``once the teacher policy acquires a basic kicking
+skill''. There is no threshold, no step count, and no automated gate anywhere. Nor does any
+of them address the value-function discontinuity that a hard reward switch creates.
+\Cref{sec:transitions} supplies both. A third gap --- how to get a policy to \emph{use} a
+newly unmasked action that it has never sampled --- is addressed in \cref{sec:oracle} with a
+privileged prune oracle, which is the AGP analogue of the teacher--student step in
+\citet{xu2025striker} but far cheaper, because unlike a robot teacher our oracle is a
+twenty-line greedy loop.
+
+% ===========================================================================
+\section{Curriculum overview}
+% ===========================================================================
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[font=\small, x=1cm, y=1cm]
+  % --- gate markers (drawn first so boxes sit on top)
+  \foreach \x/\g in {4.9/1, 9.6/2}{
+    \draw[agpgreen, thick, dashed] (\x,-0.35) -- (\x,3.15);
+    \node[font=\scriptsize\bfseries, agpgreen, above] at (\x,3.15) {gate $G_{\g}$};
+  }
+
+  % --- stage boxes
+  \node[draw, thick, fill=agpgrey, rounded corners, minimum height=2.1cm, text width=4.1cm,
+        align=center, anchor=south west] at (0.25,0.55)
+    {\textbf{\stageI{}}\\[3pt]
+     \scriptsize $\ADD$ only\\
+     \scriptsize $w_{\mathrm{par}} = 0$ (no guard cost)\\
+     \scriptsize sweep $+$ frontier priors, annealed\\[2pt]
+     \scriptsize\itshape\color{agpaccent} ends with I-b: over-saturate};
+  \node[draw, thick, fill=agpgrey, rounded corners, minimum height=2.1cm, text width=4.1cm,
+        align=center, anchor=south west] at (5.05,0.55)
+    {\textbf{\stageII{}}\\[3pt]
+     \scriptsize $\ADD$ / $\DEL$ / $\STOP$\\
+     \scriptsize $w_{\mathrm{par}} = 0.02$, prune bonus on\\
+     \scriptsize scaffolds at zero\\[2pt]
+     \scriptsize\itshape\color{agpaccent} prune-oracle warm start};
+  \node[draw, thick, fill=agpgrey, rounded corners, minimum height=2.1cm, text width=3.7cm,
+        align=center, anchor=south west] at (9.75,0.55)
+    {\textbf{\stageIII{}}\\[3pt]
+     \scriptsize state-wise constraints\\
+     \scriptsize $+\,\MOVE$ action\\
+     \scriptsize hard / extreme tiers};
+
+  % --- timeline axis
+  \draw[-{Latex[length=3mm]}, thick] (0,0) -- (14.4,0);
+  \node[right, font=\scriptsize] at (14.4,0) {steps};
+  \foreach \x/\lab in {0.25/0, 4.9/1.5M, 9.6/3.0M, 13.7/3.75M}{
+    \draw (\x,0.14) -- (\x,-0.14);
+    \node[below, font=\scriptsize] at (\x,-0.16) {\lab};
+  }
+\end{tikzpicture}
+\caption{The curriculum. Step counts are targets, not fixed schedules: each boundary is
+crossed when its performance gate (\cref{sec:transitions}) fires, with the step count acting
+only as a fallback cap. Weights are linearly interpolated across a $50$k-step blend window
+rather than switched instantaneously.}
+\label{fig:timeline}
+\end{figure}
+
+% ===========================================================================
+\section{Stage I --- \stageI{}}
+% ===========================================================================
+
+\subsection{Objective and configuration}
+
+\stageI{} answers one question: \emph{can the policy cover an arbitrary gallery at all?}
+The guard cost is zero, so the telescoped episode objective (Document 1,
+the \emph{telescoping proposition}) reduces to
+\[
+  R_{\stageI{}}(\tau) \;=\; w_{\mathrm{cov}}\,c_T \;+\; w_{\mathrm{goal}}\Ind{c_T \ge c^{\dagger}}
+  \;-\; w_{\mathrm{fail}}\Ind{c_T < c^{\dagger}}
+  \;+\; \text{(scaffolding)} ,
+\]
+i.e.\ pure maximum coverage. This is a problem with a known, strong, cheap baseline: greedy
+maximum coverage, which inherits the $1 - 1/e$ guarantee from submodularity
+\cite{nemhauser1978}. \stageI{} is not expected to beat greedy. It is expected to
+\emph{match} greedy while (a) using continuous positions rather than a candidate set and
+(b) producing, as a side effect, exactly the over-complete guard sets that \stageII{} needs.
+
+\begin{description}[style=nextline,leftmargin=1.2em]
+\item[Action mask:] mode restricted to $\{\ADD\}$. This makes the action space identical to
+  the current $[0,1]^2$ implementation.
+\item[Instance distribution $\Dctx$:] all four difficulty tiers, but sampled with a
+  difficulty-annealed weighting (\cref{sec:instances}): $(0.55, 0.30, 0.10, 0.05)$ over
+  (easy, mid, hard, extreme) at step $0$, linearly reaching uniform by the end of the stage.
+\item[Termination:] at $c_t \ge c^{\dagger}$, on the guard budget $K_{\max} = 24$, or on the
+  patience stall.
+\item[Discount:] $\gamma = 0.99$.
+\end{description}
+
+\subsection{The boundary-inward sweep prior}
+
+The project brief proposes an explicit placement order: ``go around the edges and come
+inwards''. This is a good prior for the AGP, because occlusion in a polygon with holes is
+generated at the boundary --- specifically at reflex vertices, which are what make
+Chv\'atal's $\lfloor n/3 \rfloor$ bound tight \cite{chvatal1975,fisk1978,orourke1987} --- and a
+guard placed against a wall sees a half-plane-like region with no wasted coverage behind it,
+whereas an interior guard's visibility polygon is partly redundant with itself.
+
+We encode it as the term $r_{\mathrm{sweep}}$ of Document 1, a bounded exponential kernel on
+the distance-to-boundary $\dbd$ whose target radius sweeps inward \emph{within} an episode:
+\[
+  r_{\mathrm{sweep}}(\xi, t) \;=\;
+  \exp\!\left(-\frac{\bigl(\dbd(\xi) - \mu_{\mathrm{ring}}(t)\bigr)^2}{2\sigma_s^2}\right),
+  \qquad
+  \mu_{\mathrm{ring}}(t) = \Bigl(\mu_0 + (\mu_1-\mu_0)\tfrac{t}{K_{\max}}\Bigr) \cdot L ,
+\]
+with $L$ the bounding-box diagonal, $\mu_0 = 0.02$, $\mu_1 = 0.25$, $\sigma_s = 0.05 L$.
+At $t=0$ the policy is paid for placing within $2\%$ of the diagonal of a wall; by the end
+of the guard budget the preferred band has moved to $25\%$, i.e.\ well into the interior.
+
+Two properties matter. First, the kernel is bounded in $(0,1]$, so its weight \emph{is} its
+maximum per-step contribution --- the convention every tracking reward in
+\citet{wang2025dribble} and \citet{xu2025striker} follows, and the reason a dozen terms can be
+balanced by hand. Second, it is a prior on the placement \emph{order}, not on the final
+configuration, which is structurally the same thing as the gait-phase indicators
+$\mathbf{1}_{\mathrm{feet\ swing}} \cdot \mathbf{1}_{\mathrm{swing\ period}}$ that the striker
+paper uses to install a walking rhythm in stage 1 and then zeroes in stage 2.
+
+\takeaway{%
+$r_{\mathrm{sweep}}$ is \emph{not} potential-based and therefore biases the optimum
+(Document~1, \emph{anneal-iff-non-potential}): a wall-hugging guard set is not in general optimal.
+Its weight must reach $0$ before \stageI{} ends. We ramp it down linearly over the final
+$30\%$ of the stage, so that the last part of \stageI{} is trained under the unbiased
+objective and the policy has time to unlearn the prior's distortions before the gate is
+evaluated.}
+
+The same applies to $r_{\mathrm{front}}$ (pay for landing in still-uncovered space) and
+$r_{\mathrm{sep}}$ (punish placing within $d_{\min}$ of an existing guard). Both are useful
+early --- they are what stop a random policy from stacking guards on one spot --- and both
+are wrong late: in a narrow corridor two guards genuinely should sit close together, and a
+guard placed in already-covered space can still be the best next move if it opens a new
+region. They anneal on the same schedule.
+
+\subsection{Stage I-b: deliberate over-saturation}\label{sec:overs}
+
+For the final $\sim\!150$k steps of \stageI{} we change one thing: the episode no longer
+terminates at $c^\dagger$, and instead runs to
+$K_{\mathrm{sat}} = \min\bigl(K_{\max}, \lceil 1.4\, k_{\mathrm{ref}} \rceil\bigr)$ guards.
+The purpose is to manufacture the state distribution that \stageII{} will be trained on.
+Without this, the policy hands \stageII{} a guard set that is already close to minimal,
+almost no deletion is free, and the delete head learns nothing.
+
+This is the AGP version of a trick both reference papers use in different guises: make the
+signal you want the agent to learn from artificially abundant early.
+\citet{wang2025dribble} widen the simulated camera FOV to \emph{twice} the real
+RealSense D455 field of view during stage 1, so that the active-sensing reward fires densely,
+then shrink it to the true value in stage 2. We inflate the guard count so that the
+redundancy signal fires densely, then let \stageII{} deflate it.
+
+By the \emph{redundancy-monotonicity proposition} of Document~1, the redundancy deficits $\delta^-_j$ measured at
+$K_{\mathrm{sat}}$ guards are the smallest they will ever be, so this is also the state in
+which the pruning decision is least ambiguous.
+
+\subsection{Exit gate $G_1$}
+
+See \cref{sec:transitions}. Informally: held-out feasibility $\ge 0.90$ on easy/mid and
+$\ge 0.75$ on hard/extreme, sustained over three consecutive evaluation rounds, with all
+scaffolding weights already at zero.
+
+% ===========================================================================
+\section{Stage II --- \stageII{}}
+% ===========================================================================
+
+\subsection{What changes}
+
+Three things, all of them in the weight column and the action mask:
+
+\begin{enumerate}[label=(\alph*)]
+  \item the mode head is unmasked to $\{\ADD, \DEL, \STOP\}$;
+  \item the guard-count potential is switched on, $w_{\mathrm{par}}: 0 \to 0.02$, which by
+        construction (Document 1) means $-0.02$ per $\ADD$ and $+0.02$ per $\DEL$ --- exactly
+        the ``adding is negative, removing is positive'' structure asked for;
+  \item the clean-prune bonus $w_{\mathrm{prune}}\exp(-\delta^{-}/\sigma_p)$ is switched on,
+        which pays close to the full $0.15$ when a deletion costs no coverage and decays to
+        nothing as coverage is lost --- the ``lower reward scaling with space lost'' clause.
+\end{enumerate}
+
+Simultaneously all three scaffolding weights are already at zero, and the terminal
+parsimony bonus $w_{\mathrm{pars}}(k_{\mathrm{ref}} - k_T)$ turns on at $0.25$.
+The coverage potential does \emph{not} change: it is potential-based, so leaving it at
+$w_{\mathrm{cov}} = 1.0$ costs nothing in bias and buys full protection against forgetting
+how to cover. This is where our design departs from \citet{wang2025dribble} and
+\citet{xu2025striker}, both of whom must demote their stage-1 proxy ($2.0 \to 1.0$ and
+$2.0 \to 0.5$) precisely because theirs is \emph{not} potential-based and would otherwise
+compete with the real objective.
+
+\subsection{The delete action will not be discovered by accident}\label{sec:oracle}
+
+This is the main practical risk of the whole curriculum, and it has no counterpart in the
+reference papers, whose action space never changes. At the moment $\DEL$ is unmasked, the
+policy has taken millions of $\ADD$ actions and zero $\DEL$ actions. Its mode-head logits
+for $\DEL$ and $\STOP$ have received no meaningful gradient. Worse, the first deletions it
+tries will be uniformly distributed over guards and will therefore usually be expensive,
+producing negative advantage and pushing the $\DEL$ logit further down. The likely outcome
+of a naive switch is a policy that never deletes and \stageII{} that does nothing.
+
+Four mitigations, in increasing order of effort.
+
+\paragraph{1. Reset the mode head.} Re-initialise the three mode logits to zero (uniform)
+at the switch, keeping the shared trunk and the point head. One line, and it removes the
+accumulated bias against unsampled modes.
+
+\paragraph{2. A mode-specific entropy floor.} Apply the entropy bonus to the categorical
+mode distribution separately from the continuous point distribution, with
+$\beta_{\mathcal{H}}^{\mathrm{mode}} = 0.01$ decaying to $0.002$ over the first $300$k steps
+of \stageII{} and $\beta_{\mathcal{H}}^{\mathrm{point}} = 0.003$ throughout. The current code
+runs \code{ENT\_COEF = 0.0}, which is fine for a single continuous head but wrong for a
+discrete head that must explore a newly available option.
+
+\paragraph{3. A decaying logit bias, not forced actions.} It is tempting to force
+$\DEL$ with some probability $\varepsilon$ during early \stageII{}. Do not: PPO's importance
+ratio $\pi_\theta(a|s)/\pi_{\theta_{\mathrm{old}}}(a|s)$ is computed against the policy that
+is assumed to have generated the data, and injecting off-policy actions silently corrupts
+it. Instead add a bias $b(t)$ to the $\DEL$ logit \emph{inside} the policy, so the behaviour
+policy and the policy being scored are the same distribution, and anneal $b$ from $1.5$ to
+$0$ over $200$k steps.
+
+\paragraph{4. A privileged prune oracle with DAgger warm-start.} The strongest option, and
+cheap here in a way it is not in robotics. Define:
+
+\begin{algorithm}[h]
+\small
+\caption{\textsc{GreedyPruneOracle}($\Gallery$, $\Guards$, $c^\dagger$)}
+\begin{algorithmic}[1]
+\While{true}
+  \State $\delta^{-}_j \gets f(\Guards) - f(\Guards \ominus g_j)$ \textbf{ for all } $g_j \in \Guards$
+  \State $j^\star \gets \arg\min_j \delta^{-}_j$
+  \If{$f(\Guards) - \delta^{-}_{j^\star} < c^{\dagger}$} \State \textbf{break} \EndIf
+  \State $\Guards \gets \Guards \ominus g_{j^\star}$; \; \textbf{emit} $(\DEL, g_{j^\star})$
+\EndWhile
+\State \textbf{emit} $(\STOP, \cdot)$
+\end{algorithmic}
+\end{algorithm}
+
+\noindent
+One oracle call costs $O(k^2)$ Shapely unions, which for $k \le 24$ is milliseconds --- the
+per-guard visibility polygons are already cached in \code{Security.all\_guards}. The oracle
+is \emph{privileged} in the same sense as the teacher policies in
+\citet{xu2025striker} and \citet{pinto2018asymmetric}: it uses exact continuous geometry that
+the rasterised student observation does not expose.
+
+Use it exactly as they use their teacher, with DAgger \cite{ross2011dagger}: roll out the
+student, query the oracle for the correct action at each visited state, and add a
+behaviour-cloning loss on the mode head and the point head,
+\[
+  \mathcal{L}_{\mathrm{BC}}
+  \;=\; \Ex_{s \sim \pi_\theta}\Bigl[\,
+    \mathrm{CE}\bigl(\mu_\theta(s),\, \mu^{\mathrm{oracle}}(s)\bigr)
+    + \lVert \xi_\theta(s) - \xi^{\mathrm{oracle}}(s)\rVert^2 \,\Bigr],
+\]
+with coefficient $1.0$ for the first $200$k steps of \stageII{} and linearly to $0$ by
+$500$k. Rolling out the \emph{student} and labelling with the oracle (rather than cloning
+oracle trajectories) is the whole point of DAgger: the student is corrected on the states
+its own mistakes produce. \citet{xu2025striker} state the same rationale --- ``the student
+learns not only from the teacher's demonstrations but also from states encountered due to
+its own errors''.
+
+\takeaway{%
+The oracle is a \emph{warm start}, not the target. Greedy pruning is myopic: it deletes the
+cheapest guard at each step and never considers deleting two guards and re-adding one
+better-placed guard. The policy has both $\DEL$ and $\ADD$ available and can learn exactly
+that move, which is the main source of expected improvement over greedy. This is why
+$\mathcal{L}_{\mathrm{BC}}$ must decay to zero --- the same reason
+\citet{wang2025dribble} delete their imitation reward entirely rather than decay it, ``to
+promote exploration and discovery of effective dribbling behaviors''.}
+
+\subsection{Preventing coverage regression}
+
+The coverage ratchet of Document 1, $c_t \ge \min(\bar c_t, c^\dagger) - \delta_{\mathrm{slack}}$,
+is enforced in \stageII{} as an action mask: a $\DEL$ that would violate it is rejected and
+charged $r_{\mathrm{void}}$. Note the ratchet is measured against the \emph{running maximum}
+$\bar c_t$, not against the previous step, so the $1\%$ slack cannot be spent repeatedly ---
+there is no drift exploit where the agent deletes a guard costing $0.9\%$ twenty times over.
+
+\subsection{Episode initialisation}
+
+\stageII{} episodes are drawn from a mixture:
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+\textbf{Share} & \textbf{Initial state} & \textbf{Purpose} \\
+\midrule
+$60\%$ & empty gallery & the policy must still be able to solve an instance end to end \\
+$40\%$ & saturated: $K_{\mathrm{sat}}$ guards from the frozen \stageI{} policy & dense pruning signal from step $0$ \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The $40\%$ saturated share is the direct analogue of moving the ball spawn from $10$\,m to
+$2$\,m \cite{wang2025dribble} or tightening the robot spawn annulus from $[0.5,4.0]$ to
+$[0.5,2.0]$\,m \cite{xu2025striker}: start the agent where the skill being learned is
+actually exercised. The $60\%$ empty share is the insurance those papers buy differently,
+by demoting rather than deleting their stage-1 proxy.
+
+\subsection{Exit gate $G_2$}
+
+Feasibility not degraded by more than $2$ percentage points relative to the end of
+\stageI{}, mean pruning yield $\ge 2$ guards, and competitive ratio
+$\Ex[k_T/k_{\mathrm{ref}}] \le 1.0$ --- i.e.\ the policy is at least matching greedy on guard
+count while holding coverage.
+
+% ===========================================================================
+\section{Stage III --- \stageIII{} (optional)}
+% ===========================================================================
+
+\stageIII{} is worth running only if \stageII{} converges and the residual failures are
+concentrated on the \code{hard}/\code{extreme} tiers, which is the expected outcome. It
+makes three changes.
+
+\subsection{From penalties to state-wise constraints}
+
+The regularity terms ($r_{\mathrm{proj}}$, $r_{\mathrm{void}}$, $r_{\mathrm{stop}}$) move out of
+the reward and into a constraint,
+\[
+  \max_\pi \; \Ex\Bigl[\textstyle\sum_t \gamma^t r^{\mathrm{task}}_t\Bigr]
+  \quad\text{s.t.}\quad
+  c^{\mathrm{cost}}(s_t,a_t) \le h \quad \forall (s_t,a_t)\in\tau ,
+\]
+solved with a constrained policy-gradient method such as N-P3O \cite{lee2023constrained} or
+CPO \cite{achiam2017cpo}; see also \citet{altman1999}. The motivation transfers exactly from
+\citet{xu2025striker}, who diagnose \emph{inhomogeneous credit assignment}: their task reward
+is concentrated at the kick, so ``a fixed regularization coefficient can impose
+disproportionately large penalties at certain steps --- particularly those immediately
+preceding the kick, where the agent expects high immediate future reward.''
+
+AGP has the identical profile. The first guard in an empty gallery typically captures
+$30$--$50\%$ of the area; the last one before $c^\dagger$ captures a sliver. A fixed
+$-0.25$ aiming penalty is negligible against the first and dominant against the last, so it
+suppresses exactly the delicate end-game placements that determine whether the instance is
+solved at all. Their ablation is the reason to take this seriously: raising the fixed
+coefficient from $1.0$ to $1.5$ \emph{dropped} success from $64.8\%$ to $43.4\%$, while the
+constrained formulation reached $79.5\%$. That is the signature of a problem scalar tuning
+cannot fix.
+
+Following their calibration heuristic --- threshold set to ``$1.5\times$ per-step average
+regularization cost of a walking gait'' --- we set
+\[
+  h \;=\; 1.5 \times \bigl(\text{mean per-step regularity cost of the greedy reference solver}\bigr),
+\]
+i.e.\ calibrated against a known-good reference behaviour rather than in absolute units.
+
+\subsection{A relocation action}
+
+Add a fourth mode, $\MOVE$: relocate the guard nearest to $\xi(a)$ by a bounded
+displacement emitted by a second continuous head. Pruning can only remove guards that are
+\emph{already} redundant; relocation can \emph{make} a guard redundant by improving a
+neighbour. This is the move that greedy fundamentally cannot make and is the main remaining
+source of improvement. It is listed as optional because it doubles the continuous action
+dimension and should not be introduced until \stageII{} is stable.
+
+\subsection{Hard-instance concentration}
+
+$\Dctx$ reweights to $(0.10, 0.20, 0.35, 0.35)$ over the four tiers, and instances are
+additionally sampled in proportion to their recent failure rate --- a simple
+prioritised-instance scheme. This is the only place where we use adaptive difficulty; none
+of the three reference papers has a performance-gated difficulty curriculum, though it is
+standard elsewhere in legged locomotion \cite{rudin2022,narvekar2020curriculum}.
+
+% ===========================================================================
+\section{The weight schedule}
+% ===========================================================================
+
+\Cref{tab:schedule} is the curriculum. It is deliberately formatted the way
+\citet{wang2025dribble} (their Table~I) and \citet{xu2025striker} (their Table~II) format
+theirs: one row per reward term, one column per stage.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Reward weights by stage. ``$\to$'' denotes a linear ramp within the stage;
+``---'' denotes a term whose triggering action is masked. Terms in the scaffolding group
+are the only ones that \emph{must} be scheduled (Document~1, \emph{anneal-iff-non-potential}); every
+other schedule entry is an optimisation choice, not a correctness requirement.}
+\label{tab:schedule}
+\renewcommand{\arraystretch}{1.22}
+\begin{tabularx}{\linewidth}{@{}l l X c c c@{}}
+\toprule
+\textbf{Symbol} & \textbf{Group} & \textbf{Term} & \textbf{\stageI{}} & \textbf{\stageII{}} & \textbf{\stageIII{}} \\
+\midrule
+$w_{\mathrm{cov}}$   & coverage  & coverage potential (potential-based)        & $1.0$ & $1.0$ & $1.0$ \\
+$w_{\mathrm{goal}}$  & coverage  & terminal: $c_T \ge c^{\dagger}$             & $4.0$ & $4.0$ & $4.0$ \\
+$w_{\mathrm{fail}}$  & coverage  & terminal: $c_T < c^{\dagger}$               & $2.0$ & $2.0$ & $2.0$ \\
+\addlinespace
+$w_{\mathrm{par}}$   & parsimony & guard-count potential (potential-based)     & $\mathbf{0.0}$ & $\mathbf{0.02}$ & $0.02$ \\
+$w_{\mathrm{prune}}$ & parsimony & $\exp(-\delta^{-}/\sigma_p)$ on $\DEL$      & ---   & $0.15$ & $0.15$ \\
+$w_{\mathrm{pars}}$  & parsimony & terminal: $k_{\mathrm{ref}} - k_T$          & $0.0$ & $0.25$ & $0.35$ \\
+\addlinespace
+$w_{\mathrm{front}}$ & scaffold  & landed in uncovered space                   & $0.05 \to 0$ & $0$ & $0$ \\
+$w_{\mathrm{sweep}}$ & scaffold  & boundary-inward ring prior                  & $0.10 \to 0$ & $0$ & $0$ \\
+$w_{\mathrm{sep}}$   & scaffold  & minimum guard separation                    & $0.10 \to 0$ & $0$ & $0$ \\
+\addlinespace
+$w_{\mathrm{proj}}$  & regularity& aimed outside $\Free$                       & $0.25$ & $0.25$ & constraint \\
+$w_{\mathrm{void}}$  & regularity& invalid / masked $\DEL$                     & ---    & $0.10$ & constraint \\
+$w_{\mathrm{stop}}$  & regularity& $\STOP$ with $c_t < c^{\dagger}$            & ---    & $2.0$  & constraint \\
+\midrule
+$\beta_{\mathrm{cov}}$ & \multicolumn{2}{@{}l}{advantage weight, coverage critic}  & $1$ & $1$ & $1$ \\
+$\beta_{\mathrm{par}}$ & \multicolumn{2}{@{}l}{advantage weight, parsimony critic} & $0$\,\textsuperscript{$\ast$} & $2$ & $2$ \\
+$\beta_{\mathrm{reg}}$ & \multicolumn{2}{@{}l}{advantage weight, regularity critic}& $1$ & $1$ & --- \\
+\midrule
+\multicolumn{3}{@{}l}{Action modes available}                                     & $\ADD$ & $\ADD,\DEL,\STOP$ & $+\,\MOVE$ \\
+\multicolumn{3}{@{}l}{Discount $\gamma$}                                          & $0.99$ & $0.997$ & $0.997$ \\
+\multicolumn{3}{@{}l}{$\mathcal{L}_{\mathrm{BC}}$ (prune oracle)}                 & --- & $1.0 \to 0$ & $0$ \\
+\bottomrule
+\end{tabularx}
+\\[3pt]
+\raggedright\footnotesize
+\textsuperscript{$\ast$}\,The parsimony critic is still \emph{trained} in \stageI{} on the
+parsimony reward stream; only its advantage weight is zero, so it contributes no policy
+gradient. See \cref{sec:shadow}.
+\end{table}
+
+Three entries deserve emphasis because they are the ones a reader will want to change first.
+
+\begin{itemize}
+  \item \textbf{$w_{\mathrm{par}} = 0.0$ in \stageI{}.} Not $0.005$, not ``small''. Both
+        multi-stage reference papers hold their eventual task reward at exactly zero through
+        stage 1, and the project brief asks for the same. A small nonzero value is the worst
+        of both worlds: too small to shape behaviour, large enough to make ``place no guards''
+        locally attractive to a random policy.
+  \item \textbf{$w_{\mathrm{cov}} = 1.0$ in every stage.} Because it is potential-based, its
+        weight is a pure scaling of an unbiased signal. Nothing is gained by demoting it and
+        the risk of forgetting how to cover is real.
+  \item \textbf{$\beta_{\mathrm{par}}: 0 \to 2$.} The $2{:}1$ ratio is taken directly from
+        \citet{wang2025vision}'s $\Adv_{\mathrm{total}} = 2\Adv_{\mathrm{goal}} + \Adv_{\mathrm{aux}}$.
+        The parsimony advantage is small in magnitude but low-variance (the reward is a
+        constant $\pm w_{\mathrm{par}}$ plus a bounded bonus), so it tolerates upweighting
+        better than the coverage advantage does.
+\end{itemize}
+
+% ===========================================================================
+\section{Stage transitions}\label{sec:transitions}
+% ===========================================================================
+
+\subsection{Performance gates}
+
+Every $E = 10$k steps the current policy is evaluated deterministically on the full held-out
+set, per difficulty tier. Let $\mathrm{SR}^{(i)}_\mathrm{easy/mid}$ denote the feasibility
+rate ($\Prob[c_T \ge c^{\dagger}]$) at evaluation round $i$, and similarly for
+hard/extreme. The gates are:
+
+\[
+G_1:\quad
+\begin{cases}
+  \mathrm{SR}_{\mathrm{easy/mid}}^{(i)} \ge 0.90 & \\
+  \mathrm{SR}_{\mathrm{hard/extreme}}^{(i)} \ge 0.75 & \\
+  \Ex[c_T] \ge 0.97 &
+\end{cases}
+\text{for } M = 3 \text{ consecutive } i,
+\quad\text{and}\quad w_{\mathrm{front}} = w_{\mathrm{sweep}} = w_{\mathrm{sep}} = 0 .
+\]
+
+\[
+G_2:\quad
+\begin{cases}
+  \mathrm{SR}^{(i)} \ge \mathrm{SR}^{\mathrm{end\ of\ \stageI{}}} - 0.02 & \\
+  \Ex[k_{\mathrm{peak}} - k_T] \ge 2 & \text{(pruning yield)}\\
+  \Ex[k_T / k_{\mathrm{ref}}] \le 1.0 &
+\end{cases}
+\text{for } M = 3 \text{ consecutive } i .
+\]
+
+A hard step cap ($1.5$M for \stageI{}, $1.5$M for \stageII{}) forces the transition if a gate
+never fires, with the failure logged. Requiring $M = 3$ consecutive rounds rather than a
+single crossing is the difference between a gate and a noise trigger: with only $50$
+held-out instances, a success rate near $0.9$ has a binomial standard error of
+$\sqrt{0.9 \cdot 0.1 / 50} \approx 4$ percentage points, so a single evaluation carries a
+$95\%$ interval more than $16$ points wide. Enlarging the held-out set to $200$ instances
+would be a cheaper improvement than tuning $M$.
+
+\subsection{Blending, and the value-function shock}
+
+A hard weight switch changes the reward function, and therefore the return, and therefore
+every value target the critic has been fitted to. The critic's error spikes, the advantage
+estimates become garbage for several updates, and PPO --- which trusts its advantages ---
+takes a large, badly-directed step. This is a plausible contributor to the instability
+already logged for this project ($\text{approx\_kl}$ in the tens, $\text{clip\_fraction}
+\approx 0.7$--$0.8$, policy collapse after $150$--$200$k steps), and it will get worse, not
+better, once a second stage exists. None of the three reference papers discusses it.
+
+Two mitigations, used together:
+
+\begin{enumerate}[label=(\roman*)]
+  \item \textbf{Linear blending.} Interpolate every weight linearly over
+        $N_{\mathrm{blend}} = 50$k steps:
+        $w(t) = (1-\alpha)w^{\mathrm{old}} + \alpha w^{\mathrm{new}}$, $\alpha = t/N_{\mathrm{blend}}$.
+        The action mask cannot be blended, so it flips at $\alpha = 0$; the associated
+        weights ramp from zero, which means early deletions are nearly free and the policy
+        can explore them before they start costing.
+  \item \textbf{Tighter trust region across the boundary.} Halve \code{target\_kl} and the
+        learning rate for the duration of the blend window, then restore. PPO's KL early-stop
+        \cite{schulman2017ppo} is the right tool here and it is already enabled in the current
+        code (\code{TARGET\_KL = 0.03}).
+\end{enumerate}
+
+\subsection{The shadow parsimony critic}\label{sec:shadow}
+
+Because the reward is grouped (Document~1, multi-critic advantage decomposition), each group has its own
+value head, and a head can be trained without being used. During \stageI{} we compute the
+parsimony reward stream ($-w_{\mathrm{par}}$ per $\ADD$, plus the terminal parsimony bonus)
+with the \emph{\stageII{}} weights, regress $V_{\mathrm{par}}$ against it, and set
+$\beta_{\mathrm{par}} = 0$ so it contributes nothing to the policy gradient. At the switch,
+$\beta_{\mathrm{par}}$ ramps to $2$ over the blend window against a value head that is already
+fitted.
+
+This costs one extra MLP head and no environment changes, and it removes the single largest
+source of the transition shock. It has no counterpart in the reference papers, but it is a
+direct consequence of adopting \citet{wang2025vision}'s multi-critic decomposition: once the
+critics are separate, a critic can be warmed up in advance of the stage that needs it.
+
+% ===========================================================================
+\section{Architecture}
+% ===========================================================================
+
+\subsection{Networks}
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\textbf{Component} & \textbf{Specification} \\
+\midrule
+Actor trunk   & CNN over the $64\times64\times5$ actor image: $32@8{\times}8$/4, $64@4{\times}4$/2, $64@3{\times}3$/1, ReLU, flatten, FC $256$. Scalar branch: MLP $(64,64)$. Concatenate $\to 320$. \\
+Mode head     & Linear $320 \to 3$, categorical over $\{\ADD,\DEL,\STOP\}$ (plus $\MOVE$ in \stageIII{}); invalid modes masked with $-\infty$ logits. \\
+Point head    & Linear $320 \to 4$, softplus${}+1$, parameterising two independent $\mathrm{Beta}(\alpha,\beta)$ distributions on $[0,1]$ for $a_x$, $a_y$. \\
+Critic trunk  & Separate CNN over the $64\times64\times6$ privileged image plus the full scalar set; MLP $(512,256,128)$ (wider than the actor, as in \citet{wang2025dribble}: $768/256/128$ critic vs.\ $512/256/128$ actor). \\
+Critic heads  & Three linear heads $\to 1$: $V_{\mathrm{cov}}$, $V_{\mathrm{par}}$, $V_{\mathrm{reg}}$. \\
+Activation    & ELU throughout, following \citet{wang2025vision}. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Why a Beta distribution for the point head}
+
+The action is a point in $[0,1]^2$ and the current implementation samples a Gaussian and
+clips. This is a poor fit for the AGP specifically, because good guard positions are
+frequently \emph{at} the boundary of the action range --- against a wall, in a corner, in the
+mouth of a corridor. A clipped Gaussian piles a point mass of probability at the clip
+boundary, so the log-probability of a boundary action is wrong, the entropy is wrong, and the
+policy gradient at the boundary is biased inward \cite{chou2017beta}. A Beta distribution has
+support exactly $[0,1]$, is bias-free at the boundary, and can represent both a sharp
+interior mode and a boundary-concentrated one. Given that the \stageI{} sweep prior is
+explicitly \emph{encouraging} boundary placements, this is not a minor detail.
+
+\subsection{Symmetry}
+
+The AGP is equivariant under the dihedral group $D_4$ (rotations by multiples of $90^\circ$
+and reflections) acting on the rasterised gallery, and under similarity transforms in the
+continuous problem. We exploit this twice:
+
+\begin{itemize}
+  \item \textbf{Augmentation:} each instance is presented under a uniformly sampled $D_4$
+        transform, which multiplies the effective dataset by $8$ at zero cost.
+  \item \textbf{Consistency loss:} following the mirror-symmetry loss of
+        \citet{wang2025vision} (their Eqs.~5--6, coefficient $10$),
+        \[
+          \mathcal{L}_{\mathrm{sym}}
+          = \Ex\Bigl[\bigl\lVert \xi_\theta(o) - M^{-1}\xi_\theta(M o)\bigr\rVert^2
+          + \mathrm{KL}\bigl(\mu_\theta(o)\,\Vert\,\mu_\theta(M o)\bigr)\Bigr],
+          \quad M \sim D_4 ,
+        \]
+        with coefficient $1.0$: the point head should be equivariant, the mode head
+        invariant. They needed this because their policy collapsed onto always kicking with
+        one leg; the AGP analogue is a policy that collapses onto, say, always sweeping
+        clockwise from the top-left.
+\end{itemize}
+
+% ===========================================================================
+\section{PPO hyperparameters}
+% ===========================================================================
+
+\begin{table}[h]
+\centering
+\small
+\caption{PPO settings per stage. The \stageI{} column is close to the current code, with
+two changes: vectorised environments and a nonzero entropy coefficient.}
+\label{tab:ppo}
+\begin{tabularx}{\linewidth}{@{}l c c c X@{}}
+\toprule
+\textbf{Parameter} & \textbf{\stageI{}} & \textbf{\stageII{}} & \textbf{\stageIII{}} & \textbf{Note} \\
+\midrule
+Discount $\gamma$        & $0.99$ & $0.997$ & $0.997$ & terminal parsimony must survive $\sim 30$ steps \\
+GAE $\lambda$            & $0.95$ & $0.95$  & $0.95$  & \cite{schulman2016gae} \\
+Clip range $\epsilon$    & $0.2$  & $0.15$  & $0.10$  & tightened as the policy gets better \\
+\code{target\_kl}        & $0.03$ & $0.02$  & $0.015$ & halved during blend windows \\
+Learning rate            & $1\!\times\!10^{-4}$ & $5\!\times\!10^{-5}$ & $3\!\times\!10^{-5}$ & constant; halved during blend windows \\
+Epochs per update        & $5$    & $5$     & $4$     & as in current code \\
+Entropy: mode head       & ---    & $0.01 \to 0.002$ & $0.002$ & critical for $\DEL$ discovery (\cref{sec:oracle}) \\
+Entropy: point head      & $0.005$& $0.003$ & $0.001$ & current code uses $0.0$ \\
+Parallel envs            & $16$   & $16$    & $16$    & \code{SubprocVecEnv}; currently $1$ \\
+Steps per env per update & $256$  & $256$   & $256$   & rollout of $4096$ transitions \\
+Minibatches per epoch    & $4$    & $4$     & $4$     & as in \citet{wang2025vision} \\
+Max grad norm            & $0.5$  & $0.5$   & $0.5$   & \\
+Budget (steps)           & $1.5$M & $1.5$M  & $0.75$M & gates may trigger earlier \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The single most impactful line in \cref{tab:ppo} is probably \textbf{parallel envs}. The
+current run uses one environment, so a $2048$-step rollout is one long, highly autocorrelated
+trajectory through a handful of galleries; the resulting gradient is a poor estimate of the
+population gradient, and this is a textbook cause of the enormous \code{approx\_kl} values
+($10$--$100$ against a target of $0.01$--$0.05$) already recorded. The reference papers run
+$4{,}096$ \cite{wang2025dribble} and $16{,}384$ \cite{wang2025vision} environments; we cannot
+match that with Shapely on CPU, but $16$ processes is straightforward and changes the
+variance by more than an order of magnitude. Profile the visibility-polygon computation
+first --- it is the bottleneck, it is $O(n \log n)$ per guard with $n$ up to $\sim\!100$
+vertices including holes, and it is called once per step.
+
+% ===========================================================================
+\section{Instance curriculum and augmentation}\label{sec:instances}
+% ===========================================================================
+
+The locomotion papers randomise physics (friction, mass, CoM, actuator gains, latency) to
+close a sim-to-real gap. We have no sim-to-real gap; our generalisation gap is across
+\emph{gallery instances}, so the analogue of domain randomisation is instance randomisation.
+
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\textbf{Mechanism} & \textbf{Detail} \\
+\midrule
+Difficulty mixture & Tier sampling weights $(0.55,0.30,0.10,0.05) \to$ uniform over \stageI{}; uniform in \stageII{}; $(0.10,0.20,0.35,0.35)$ in \stageIII{}. \\
+$D_4$ augmentation & Uniform random rotation/reflection of each instance at reset. \\
+Scale jitter       & Uniform scale in $[0.8,1.25]$; all reward terms are already scale-free (areas normalised by $A$, distances by the bounding-box diagonal). \\
+Vertex jitter      & Gaussian perturbation of outer vertices with $\sigma = 0.01 L$, rejecting non-simple results; generates fresh instances from a finite dataset. \\
+Prioritised sampling & \stageIII{} only: sample instances with probability $\propto (1 + \text{recent failure rate})$. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Vertex jitter deserves a note: with $N_{\mathrm{train}} = 500$ galleries and $1.5$M steps at
+$\sim\!10$ steps per episode, each gallery is seen roughly $300$ times, which is well into
+memorisation territory. Jitter is the cheapest defence, and it is closer in spirit to what
+the locomotion papers do (they never reuse an exact initial state) than a fixed dataset is.
+
+% ===========================================================================
+\section{Evaluation and ablations}
+% ===========================================================================
+
+\subsection{Baselines}
+
+\begin{itemize}
+  \item \textbf{Random interior placement} --- the floor.
+  \item \textbf{Greedy max-coverage} over a candidate set (all vertices, reflex vertices, and
+        a $32\times32$ interior grid), which defines $k_{\mathrm{ref}}$. This is the baseline
+        to beat, and it is a strong one \cite{nemhauser1978,feige1998,ghosh2010}.
+  \item \textbf{Greedy $+$ oracle prune} (\cref{sec:oracle}) --- the honest baseline for
+        \stageII{}, since our policy has access to the same pruning move.
+  \item \textbf{Exact IP} \cite{couto2011,tozoni2016} on the \code{easy} tier only, to
+        establish the true optimum where it is computable.
+\end{itemize}
+
+Reporting against greedy alone is not enough: if \stageII{} only recovers what a greedy prune
+would have given anyway, the learned policy has added nothing.
+
+\subsection{Ablations}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Ablation protocol. Each row isolates one design decision from this document or
+Document 1.}
+\label{tab:ablations}
+\begin{tabularx}{\linewidth}{@{}l X X@{}}
+\toprule
+\textbf{Ablation} & \textbf{Change} & \textbf{What it tests} \\
+\midrule
+A1 Single stage      & $w_{\mathrm{par}} = 0.02$ and $\DEL$ unmasked from step $0$ & The core claim. \citet{wang2025dribble} see $86.7\% \to 33.0\%$ from this change. \\
+A2 No pruning        & \stageI{} only, run for the full $3$M steps & Isolates \stageII{}'s contribution from extra training. \\
+A3 Sparse reward     & Terminal $c_T$ and $k_T$ only, no potentials & Whether the dense telescoping decomposition matters (Document~1, telescoping proposition). \\
+A4 No annealing      & Scaffolding weights held constant & Tests the anneal-iff-non-potential rule directly; predicts a wall-hugging, over-separated final policy. \\
+A5 Single critic     & One value head on the summed reward & \citet{wang2025vision}'s multi-critic claim. \\
+A6 No oracle         & \stageII{} without $\mathcal{L}_{\mathrm{BC}}$ & Whether $\DEL$ is discovered unaided (\cref{sec:oracle}). \\
+A7 Hard switch       & $N_{\mathrm{blend}} = 0$, no shadow critic & Measures the transition shock (\cref{sec:shadow}). \\
+A8 No sweep prior    & $w_{\mathrm{sweep}} = 0$ throughout & Whether ``edges first, then inwards'' helps or only slows convergence. \\
+A9 Gaussian head     & Clipped Gaussian instead of Beta & Boundary-action bias \cite{chou2017beta}. \\
+A10 Fixed penalty    & \stageIII{} with fixed coefficients instead of constraints & \citet{xu2025striker}'s inhomogeneous-credit claim. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Metrics are those of Document 1: feasibility rate, mean coverage, guard count conditioned on
+success, competitive ratio $k_T/k_{\mathrm{ref}}$, pruning yield, and residual redundancy.
+Report all of them per difficulty tier, over at least three seeds --- none of the three
+reference papers reports seed variance, which is a weakness worth not inheriting.
+
+% ===========================================================================
+\section{Implementation roadmap}
+% ===========================================================================
+
+Ordered by dependency, against the existing code.
+
+\begin{enumerate}[label=\textbf{R\arabic*.},leftmargin=2.7em]
+  \item \textbf{Fix truncation bootstrapping.} Set \code{info["TimeLimit.truncated"] = True}
+        on every \code{truncated} return in \code{ArtGalleryEnv.step}. One line; fixes a
+        systematic value-target bias (Document~1, truncation-bootstrapping remark).
+  \item \textbf{Add the terminal reward.} $w_{\mathrm{goal}}$, $w_{\mathrm{fail}}$ in
+        \code{step()}; $w_{\mathrm{pars}}$ once $k_{\mathrm{ref}}$ exists.
+  \item \textbf{Precompute $k_{\mathrm{ref}}$.} Extend \code{generate\_polygon\_dataset.py} to
+        run greedy max-coverage per instance and store \code{k\_ref} in the JSON record.
+        Also store the greedy guard positions --- they are useful for the oracle and for
+        previews.
+  \item \textbf{Vectorise.} \code{SubprocVecEnv} with $16$ workers. Profile the ray sweep in
+        \code{security.py} first; cache per-guard visibility polygons (already done via
+        \code{all\_guards}) and avoid recomputing the union from scratch on $\ADD$.
+  \item \textbf{Extend the observation} to the five actor channels and the privileged critic
+        channels of Document~1's observation specification. This is the largest change and gates
+        everything downstream.
+  \item \textbf{Extend the action space} to $\code{Dict}(\code{mode}{:}\,\code{Discrete(3)},
+        \code{point}{:}\,\code{Box}(0,1,(2,)))$ with masking. Note that Stable-Baselines3's
+        stock PPO does not support action masking or Dict action spaces; either use
+        \code{sb3-contrib}'s \code{MaskablePPO} with a factored discrete space, or implement
+        a custom \code{ActorCriticPolicy} with a composite distribution. Budget real time
+        for this.
+  \item \textbf{Weight scheduler.} A callback that owns the stage state machine: current
+        stage, blend progress, gate evaluation, and the weight vector pushed to the env via
+        \code{set\_attr}. Keep the schedule in one declarative table so it is diffable.
+  \item \textbf{Multi-critic.} Three value heads, grouped reward returned in
+        \code{info["reward\_groups"]}, advantage combination per Document~1's multi-critic decomposition.
+  \item \textbf{Prune oracle and DAgger loss.} \cref{sec:oracle}. Implement the oracle first
+        as a standalone evaluation baseline (it is useful on its own), then wire in the BC
+        loss.
+  \item \textbf{Beta policy head}, $D_4$ augmentation, symmetry loss.
+  \item \textbf{\stageIII{}} only after \stageII{} is stable.
+\end{enumerate}
+
+Items R1--R4 are worth doing regardless of whether the curriculum is adopted; they are
+straightforward fixes to the existing single-stage setup and several of them plausibly
+address the instability already observed.
+
+% ===========================================================================
+\section{Risks}
+% ===========================================================================
+
+\begin{description}[style=nextline,leftmargin=1.2em]
+\item[The delete action is never used.] The main risk; \cref{sec:oracle} gives four
+  independent mitigations. Diagnostic: log the empirical mode distribution per stage. If
+  $\Prob[\DEL] < 0.05$ after $300$k \stageII{} steps, the warm start has failed.
+\item[Catastrophic forgetting of placement.] Mitigated by keeping $w_{\mathrm{cov}}$ fixed and
+  by the $60\%$ empty-gallery share in \stageII{}. Diagnostic: feasibility rate must not fall
+  by more than $2$ points across the boundary --- this is built into gate $G_2$.
+\item[Pruning that quietly costs coverage.] The ratchet against the running maximum $\bar c_t$
+  prevents drift, but $\epsilon^\star \approx 2.2\%$ (Document 1) still allows a single
+  meaningful concession. If evaluation shows coverage creeping down, lower
+  $w_{\mathrm{par}}$ rather than raising $w_{\mathrm{prune}}$: the exchange rate
+  $\epsilon = w_{\mathrm{par}}/w_{\mathrm{cov}}$ is what sets the tolerance.
+\item[Compute.] Every step calls exact ray-sweep visibility, and $\DEL$ additionally requires
+  $k$ set-difference evaluations for the redundancy channel. With $16$ envs $\times$ $3$M
+  steps this is the dominant cost. Consider computing $\delta^-_j$ on a coarse raster for the
+  observation while keeping the exact value for the reward.
+\item[Over-fitting to $500$ galleries.] Addressed by vertex jitter and $D_4$ augmentation
+  (\cref{sec:instances}); monitor the train/held-out feasibility gap explicitly.
+\item[The curriculum is not needed.] Possible: \citet{wang2025vision} solve a comparably
+  hard task \emph{single-stage}, and attribute it to potential-based shaping plus a
+  multi-critic split --- both of which we also use. Ablation A1 is the test, and it should be
+  run early rather than at the end, because a negative result would save most of this work.
+\end{description}
+
+% ===========================================================================
+\section{Summary}
+% ===========================================================================
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+  \item \textbf{\stageI{} (\stageI{})}: cover the gallery with the guard cost at exactly zero,
+        under a boundary-inward placement prior and two other scaffolding terms that are all
+        annealed to zero before the stage ends. A short over-saturation phase at the end
+        deliberately manufactures the redundant guard sets that \stageII{} learns from.
+  \item \textbf{\stageII{} (\stageII{})}: unmask $\DEL$ and $\STOP$, switch on the guard cost
+        (so adding costs and removing refunds), and add a bounded bonus
+        $\exp(-\delta^{-}/\sigma_p)$ that pays in full for a free removal and decays as
+        coverage is lost. A coverage ratchet against the running maximum prevents regression.
+  \item \textbf{\stageIII{} (\stageIII{}, optional)}: move the regularity penalties into
+        state-wise constraints, add a relocation action, and concentrate on hard instances.
+  \item The curriculum is entirely a weight schedule (\cref{tab:schedule}) plus an action
+        mask over one fixed MDP. Only the three scaffolding terms \emph{must} be annealed;
+        everything else is potential-based and unbiased (Document 1).
+  \item Three things the reference papers do not supply and we add: quantitative
+        stage gates, a blended transition with a shadow-trained parsimony critic, and a
+        privileged greedy prune oracle used as a DAgger warm start for the newly unmasked
+        delete action.
+  \item Run ablation A1 (single-stage) early. It is the one experiment that could invalidate
+        the premise.
+\end{enumerate}
+
+\bibliographystyle{plainnat}
+\renewcommand{\refname}{References}
+\bibliography{refs}
+
+\end{document}

@@ -1,0 +1,1034 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{agpstyle}
+
+\title{\bfseries A Markov Decision Process Formulation of the\\ Continuous Art Gallery Problem\\[4pt]
+\large Document 1 of 2: States, Actions, Dynamics and Reward}
+\author{AGP Project --- Design Note}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+We give a precise Markov Decision Process (MDP) formulation of the continuous Art Gallery
+Problem (AGP) with holes, as the decision problem solved by the PPO agent in
+\code{Polygons dataset/ppo\_agp.py}. The formulation is deliberately built so that a
+\emph{staged} training curriculum --- first saturate the gallery with guards, then prune
+them --- is expressible purely as a reweighting of a single fixed reward basis, with no
+change to the state space, the action space or the transition kernel. Two structural
+results organise the design. First, the coverage set function is monotone submodular, so
+the \emph{exclusive area} of a guard (what is lost if it is removed) can only shrink as
+more guards are added; redundancy is therefore a quantity that only becomes measurable
+\emph{after} saturation, which is the formal justification for the saturate-then-prune
+ordering. Second, both dense reward components we use are potential-based in the sense of
+Ng et al., and their discounted sum telescopes \emph{exactly} into the sparse terminal
+objective ``cover the gallery with as few guards as possible''. Consequently the dense
+signal introduces no bias, and the curriculum controls only \emph{when} a gradient exists,
+never \emph{what} is optimal. Auxiliary terms that are not potential-based are identified
+explicitly, and we adopt the rule that precisely those terms must be annealed to zero.
+The companion document specifies the three-stage PPO curriculum built on top of this MDP.
+\end{abstract}
+
+\tableofcontents
+
+% ===========================================================================
+\section{Scope and relation to the existing code}
+% ===========================================================================
+
+\subsection{The problem}
+
+An \emph{art gallery} is a simple polygon, possibly with polygonal holes. A \emph{guard}
+is a point inside the gallery; it sees every point connected to it by a segment lying
+entirely inside the gallery. The classical AGP asks for the smallest set of guards whose
+union of visibility regions is the whole gallery. Chv\'atal's theorem
+\cite{chvatal1975}, with Fisk's proof \cite{fisk1978}, gives the tight worst-case bound of
+$\lfloor n/3 \rfloor$ vertex guards for a simple $n$-gon, but finding a \emph{minimum}
+guard set is NP-hard \cite{leelin1986}, hard to approximate below a logarithmic factor
+\cite{eidenbenz2001}, and in the continuous (point-guard) setting the decision problem is
+$\exists\mathbb{R}$-complete \cite{abrahamsen2018}. Exact solvers exist but scale poorly
+and are usually restricted to vertex or grid guard candidates
+\cite{couto2011,tozoni2016}. This combination --- geometric, combinatorial, NP-hard,
+cheap to simulate, with a natural incremental decision structure --- is exactly the profile
+that makes a learned construction heuristic attractive
+\cite{mazyavkina2021,kool2019attention}.
+
+\subsection{Why write the MDP down}
+
+The current implementation already \emph{is} an MDP, but it was assembled incrementally:
+reward terms were added to fix specific failure modes (aiming outside the polygon,
+stacking guards, deterministic-evaluation deadlock) rather than derived from a stated
+objective. Writing the MDP down serves three purposes.
+
+\begin{enumerate}[label=(\roman*)]
+  \item It separates the \emph{objective} (what we want) from the \emph{shaping} (how we
+        make it learnable), which in turn tells us which reward terms may stay fixed
+        forever and which must be annealed away.
+  \item It makes the staged curriculum a property of the \emph{weights}, not of the
+        environment, so a single environment implementation serves all stages. Every
+        locomotion paper we draw on does exactly this: \citet{wang2025dribble} and
+        \citet{xu2025striker} both keep one reward basis and publish one weight column per
+        stage.
+  \item It exposes the action space that the guard-removal idea requires. Pruning is not
+        expressible in the current $\Aspace = [0,1]^2$ ``place a guard'' action space at
+        all, so the extension has to be stated before it can be trained.
+\end{enumerate}
+
+\subsection{The two documents}
+
+This document defines $\Mdp$: state, action, dynamics, observation, reward basis and
+constraints, together with the calibration of the reward weights. The companion document,
+\emph{A Three-Stage PPO Curriculum for the Art Gallery Problem}, fixes the weight schedule
+per stage, the stage-transition criteria, the network architecture and the PPO
+hyperparameters, and gives the evaluation and ablation protocol.
+
+% ===========================================================================
+\section{Geometric preliminaries}
+% ===========================================================================
+
+\subsection{Gallery instances}
+
+\begin{definition}[Gallery]
+A \emph{gallery instance} is a pair $\Gallery = (\Poly, \Holes)$ where $\Poly \subset \Real^2$
+is a simple polygon with vertex list $(p_1,\dots,p_n)$ and
+$\Holes = \{H_1,\dots,H_m\}$ is a finite set of pairwise disjoint simple polygons with
+$H_i \subset \operatorname{int}\Poly$. The \emph{free space} is the closed region
+\[
+  \Free(\Gallery) \;=\; \Poly \setminus \bigcup_{i=1}^{m} \operatorname{int} H_i ,
+  \qquad
+  A \;=\; \Area{\Free} \;>\; 0 ,
+\]
+with $\Area{\cdot}$ denoting Lebesgue measure in the plane. We write $\partial\Free$ for
+its boundary (outer boundary together with all hole boundaries) and
+$\dbd(q) = \operatorname{dist}(q, \partial\Free)$.
+\end{definition}
+
+In the repository an instance is a JSON record with keys \code{outer\_points},
+\code{holes}, \code{area} and \code{difficulty}, produced by
+\code{generate\_polygon\_dataset.py} in four difficulty tiers (\code{easy}, \code{mid},
+\code{hard}, \code{extreme}) that scale the vertex count ($8$--$12$ up to $24$--$40$), the
+irregularity and spikiness of the outer boundary, and the number of holes ($1$--$3$ up to
+$8$--$14$). The tiers will serve as the instance-difficulty curriculum in Document 2.
+
+\subsection{Visibility and coverage}
+
+\begin{definition}[Visibility polygon]
+For $g \in \Free$, the visibility polygon is
+\[
+  \Vis(g) \;=\; \bigl\{\, q \in \Free \;:\; \overline{gq} \subseteq \Free \,\bigr\}.
+\]
+\end{definition}
+
+\code{Security.get\_area\_coverage\_of\_guard} computes $\Vis(g)$ exactly by the standard
+angular ray-sweep: rays are cast at every polygon and hole vertex angle, perturbed by
+$\pm\varepsilon$ to capture the two sides of each occluding reflex vertex, the nearest
+boundary hit along each ray is retained, and the hits are assembled in angular order and
+clipped back to $\Free$. The result is an exact polygon, not a raster approximation ---
+this matters, because it means every area quantity below is computed in continuous
+geometry even though the agent \emph{perceives} the gallery as an image.
+
+\begin{definition}[Coverage set function]
+For a finite $S \subset \Free$ let
+\[
+  \Cov(S) \;=\; \bigcup_{g \in S} \Vis(g),
+  \qquad
+  f(S) \;=\; \frac{\Area{\Cov(S)}}{A} \in [0,1],
+  \qquad
+  \Unc(S) \;=\; \Free \setminus \Cov(S).
+\]
+We call $f(S)$ the \emph{coverage fraction} and $u(S) = 1 - f(S)$ the \emph{uncovered
+fraction}.
+\end{definition}
+
+\subsection{Submodularity, and why pruning must come second}
+
+\begin{proposition}[Monotone submodularity]\label{prop:submod}
+$f$ is normalised ($f(\emptyset) = 0$), monotone ($S \subseteq S' \Rightarrow f(S) \le f(S')$)
+and submodular: for all $S \subseteq S' \subset \Free$ and all $g \in \Free$,
+\[
+  f(S \cup \{g\}) - f(S) \;\ge\; f(S' \cup \{g\}) - f(S').
+\]
+\end{proposition}
+
+\begin{proof}
+$f$ is a (continuous) coverage function: $f(S) = \nu\bigl(\bigcup_{g \in S} \Vis(g)\bigr)$
+for the finite measure $\nu(\cdot) = \Area{\cdot}/A$. Normalisation and monotonicity are
+immediate. For submodularity, write the marginal gain as the measure of the part of
+$\Vis(g)$ not already covered,
+$f(S \cup \{g\}) - f(S) = \nu\bigl(\Vis(g) \setminus \Cov(S)\bigr)$.
+Since $S \subseteq S'$ implies $\Cov(S) \subseteq \Cov(S')$, we get
+$\Vis(g)\setminus\Cov(S') \subseteq \Vis(g)\setminus\Cov(S)$ and the claim follows by
+monotonicity of $\nu$.
+\end{proof}
+
+Two quantities drive the whole design. When a guard is \emph{added} to the current set
+$S$, the relevant number is its \emph{marginal gain}; when a guard already in $S$ is
+considered for \emph{removal}, the relevant number is its \emph{exclusive area}.
+
+\begin{definition}[Marginal gain and exclusive area]
+For $g \notin S$ and $g_j \in S$,
+\[
+  \delta^{+}(g \mid S) \;=\; f(S \cup \{g\}) - f(S)
+  \;=\; \nu\bigl(\Vis(g)\setminus\Cov(S)\bigr),
+  \qquad
+  \delta^{-}(g_j \mid S) \;=\; f(S) - f(S \setminus \{g_j\}).
+\]
+We call $\delta^{-}(g_j \mid S)$ the \emph{redundancy deficit} of $g_j$; it is exactly the
+coverage that would be lost by deleting $g_j$. A guard with $\delta^{-} = 0$ is
+\emph{strictly redundant}.
+\end{definition}
+
+\begin{proposition}[Redundancy is only revealed after saturation]\label{prop:prune}
+Let guards be inserted in the order $g_1, g_2, \dots, g_K$ and write
+$S_j = \{g_1,\dots,g_j\}$. Let $\delta^{+}_j = \delta^{+}(g_j \mid S_{j-1})$ be the gain at
+insertion time, and $\delta^{-}_j = \delta^{-}(g_j \mid S_K)$ the redundancy deficit at the
+end. Then for every $j$,
+\[
+  \delta^{-}_j \;\le\; \delta^{+}_j ,
+\]
+and more generally $\delta^{-}(g_j \mid S)$ is non-increasing in $S$ for $S \ni g_j$.
+\end{proposition}
+
+\begin{proof}
+Put $B = S_K \setminus \{g_j\}$ and $A' = S_{j-1}$. Then $A' \subseteq B$ and, by
+\cref{prop:submod},
+$\delta^{+}_j = f(A' \cup \{g_j\}) - f(A') \ge f(B \cup \{g_j\}) - f(B) = \delta^{-}_j$.
+The monotonicity claim is the same inequality applied to two nested sets.
+\end{proof}
+
+\Cref{prop:prune} is the formal statement of the intuition behind the staged curriculum
+requested for this project. A guard that was worth placing can only become \emph{cheaper}
+to delete as the gallery fills up --- never more expensive. Therefore:
+
+\takeaway{%
+\textbf{Consequence for the curriculum.} Deletion decisions taken early in an episode are
+evaluated against an optimistic (too large) redundancy deficit, and deletion decisions
+taken after saturation are evaluated against the smallest deficit that guard will ever
+have. Spending the first stage of training purely on \emph{coverage}, and only then
+switching on the delete action and the guard cost, is not merely a convenience: it is the
+regime in which the pruning signal is maximally informative and least noisy.}
+
+Two further consequences are worth recording. The greedy policy ``repeatedly add the
+guard of maximum marginal gain'' inherits the $1 - 1/e$ guarantee for budgeted coverage
+\cite{nemhauser1978} and the $\ln$-factor guarantee for full cover \cite{feige1998}, which
+is essentially optimal for set cover; so a well-trained \stageI{} stage should approach,
+not exceed, greedy. The gains available to a learned policy come from (a) choosing
+\emph{continuous} guard positions rather than a finite candidate set and (b) the pruning
+that greedy never performs, since greedy solutions are not minimal --- a greedy cover can
+contain strictly redundant elements. This is precisely the slack that \stageII{} targets.
+
+% ===========================================================================
+\section{The decision process}
+% ===========================================================================
+
+\subsection{A contextual family of deterministic MDPs}
+
+A single gallery induces a deterministic MDP; the learning problem is over a
+\emph{distribution} of galleries. We therefore use the contextual MDP formalism
+\cite{hallak2015contextual}.
+
+\begin{definition}[AGP contextual MDP]
+Let $\Dctx$ be a distribution over gallery instances. The AGP contextual MDP is
+\[
+  \Mdp \;=\; \bigl\langle\, \Dctx,\; \Sspace,\; \Aspace,\; \Tkernel,\; \Rfun,\; \gamma,\; \Ospace,\; \mathcal{O} \,\bigr\rangle,
+\]
+where for each context $\Gallery \sim \Dctx$ the tuple
+$\langle \Sspace_\Gallery, \Aspace, \Tkernel_\Gallery, \Rfun_\Gallery, \gamma \rangle$ is a
+deterministic finite-horizon MDP, $\Ospace$ is the observation space and
+$\mathcal{O}: \Sspace \to \Ospace$ the (deterministic, lossy) observation map.
+\end{definition}
+
+All stochasticity in the environment comes from $\Dctx$ and from the policy; given the
+instance and the action sequence, the trajectory is determined. This is worth stating
+because it has a practical consequence: the value function's irreducible variance is
+entirely \emph{instance} variance, so evaluation must always be reported per difficulty
+tier, and a fixed held-out instance set is the only meaningful validation signal.
+
+\subsection{State}
+
+\begin{definition}[State]\label{def:state}
+A state at step $t$ is
+\[
+  s_t \;=\; \bigl(\, \Gallery,\; \Guards_t,\; t,\; \bar{c}_t \,\bigr)
+  \;\in\; \Sspace,
+\]
+where $\Gallery$ is the (fixed) instance, $\Guards_t = (g_1,\dots,g_{k_t}) \in \Free^{k_t}$
+is the ordered tuple of currently placed guards, $t$ is the step index and
+$\bar{c}_t = \max_{\tau \le t} f(\Guards_\tau)$ is the running best coverage
+(used by the coverage ratchet of \cref{sec:constraints}). We write
+$k_t = |\Guards_t|$, $c_t = f(\Guards_t)$, $u_t = 1 - c_t$.
+\end{definition}
+
+\begin{remark}[Why $\Guards_t$ and not only $\Cov_t$]
+If the only action were $\ADD$, the covered region $\Cov_t$ would be a sufficient statistic:
+the marginal gain of a new guard depends on the current coverage alone. Once $\DEL$ is
+admitted this is false --- evaluating a deletion requires knowing \emph{which} guards
+produced the coverage, i.e.\ the individual $\Vis(g_j)$. The guard tuple must therefore be
+part of the state, and, as \cref{sec:obs} discusses, the observation must carry enough
+information about it for the policy to act on deletions at all.
+\end{remark}
+
+\subsection{Action space}
+
+\begin{definition}[Action space]\label{def:action}
+\[
+  \Aspace \;=\; \underbrace{\{\ADD,\ \DEL,\ \STOP\}}_{\text{mode } \mu}
+  \;\times\;
+  \underbrace{[0,1]^2}_{\text{point } a}.
+\]
+Given a state with bounding box $\operatorname{bbox}(\Free) = [x_{\min},x_{\max}] \times
+[y_{\min},y_{\max}]$, the normalised point $a = (a_x,a_y)$ is decoded to
+\[
+  \xi(a) \;=\; \bigl(x_{\min} + a_x (x_{\max}-x_{\min}),\; y_{\min} + a_y (y_{\max}-y_{\min})\bigr).
+\]
+\end{definition}
+
+The three modes are interpreted as follows.
+
+\begin{description}[style=nextline,leftmargin=1.2em]
+  \item[$\ADD$:] place a guard at $\proj(\xi(a))$, where $\proj$ is the projection into the
+        free space defined in \cref{eq:proj}. A guard is \emph{always} placed.
+  \item[$\DEL$:] delete the guard nearest to the decoded point,
+        $j^\star = \arg\min_{j \le k_t} \lVert g_j - \xi(a) \rVert_2$. If $\Guards_t = \emptyset$
+        the action is a no-op and incurs the penalty $r_{\mathrm{void}}$.
+  \item[$\STOP$:] commit the current guard set and terminate the episode.
+\end{description}
+
+\begin{remark}[Deletion as a geometric pointer]
+Addressing a guard by a point in the plane rather than by an index keeps the action space
+fixed-size and permutation-invariant, and reuses the same continuous head as $\ADD$. This
+mirrors the trick in \citet{xu2025striker}, where the velocity command is not an external
+input but is \emph{derived from geometry} each step ($v^{\mathrm{target}}_t$ is the robot--ball
+unit vector scaled by a magnitude). Here the same idea turns ``which of the $k_t$ guards''
+--- a variable-size discrete choice --- into ``where'', a fixed-size continuous one.
+\end{remark}
+
+\begin{remark}[Backwards compatibility]
+Masking the mode head to $\{\ADD\}$ recovers exactly the action space of the current
+implementation, $\Aspace = [0,1]^2$. Stage~\stageI{} of the curriculum runs under this
+mask, so no separate environment is needed.
+\end{remark}
+
+\paragraph{Projection into the free space.}
+The bounding box strictly contains $\Free$, so a decoded point may land outside the
+polygon or inside a hole. Rather than rejecting the action we project:
+\begin{equation}\label{eq:proj}
+  \proj(q) \;=\;
+  \begin{cases}
+    q, & q \in \operatorname{int}\Free, \\[3pt]
+    q^\star + \theta\,(q_{\mathrm{ref}} - q^\star), & \text{otherwise,}
+  \end{cases}
+  \qquad
+  q^\star = \arg\min_{p \in \Free}\lVert p - q\rVert_2 ,
+\end{equation}
+where $q_{\mathrm{ref}}$ is a fixed interior reference point (Shapely's
+\code{representative\_point}) and $\theta$ is the smallest value in a fixed increasing
+ladder for which the result is strictly interior. We record the indicator
+$\iota_t = \Ind{\xi(a) \notin \operatorname{int}\Free}$ for the reward.
+
+This is not cosmetic. Without projection, a deterministic (mean-action) evaluation policy
+that emits an invalid point places no guard, the observation is unchanged, and the policy
+re-emits the same invalid point forever --- an absorbing deadlock that produced $0\%$
+coverage on at least one held-out instance before the fix. Projection guarantees the state
+advances on every step, which makes the MDP \emph{progressive}: no action can leave the
+state unchanged. That is a property worth preserving in any future action-space extension.
+
+\subsection{Transition}
+
+The transition is deterministic. With $\xi = \xi(a)$:
+\[
+  \Guards_{t+1} \;=\;
+  \begin{cases}
+    \Guards_t \oplus \proj(\xi), & \mu = \ADD, \\[2pt]
+    \Guards_t \ominus g_{j^\star}, & \mu = \DEL,\ \Guards_t \neq \emptyset, \\[2pt]
+    \Guards_t, & \text{otherwise,}
+  \end{cases}
+  \qquad
+  t \mapsto t+1,
+  \qquad
+  \bar{c}_{t+1} = \max\bigl(\bar{c}_t,\, f(\Guards_{t+1})\bigr),
+\]
+where $\oplus$ and $\ominus$ are tuple append and removal. Coverage is maintained
+incrementally: $\Cov_{t+1} = \Cov_t \cup \Vis(g)$ on an add, and
+$\Cov_{t+1} = \bigcup_{j \ne j^\star}\Vis(g_j)$ on a delete (a re-union, which is why the
+per-guard visibility polygons are cached in \code{Security.all\_guards}).
+
+\subsection{Initial state and instance distribution}
+
+$s_0 = (\Gallery, \emptyset, 0, 0)$ with $\Gallery \sim \Dctx$: every episode starts from
+an \emph{empty} gallery. Document 2 varies $\Dctx$ across stages (difficulty tiers,
+$D_4$ symmetry augmentation) and discusses a partially-saturated initialisation as an
+optional accelerator for \stageII{} --- the analogue of \citet{wang2025dribble} moving the
+ball spawn radius from $10$\,m to $2$\,m between stages, and of \citet{xu2025striker}
+tightening the robot spawn annulus from $[0.5,4.0]$\,m to $[0.5,2.0]$\,m.
+
+\subsection{Termination and horizon}\label{sec:term}
+
+Let $c^{\dagger}$ be the coverage threshold at which an instance counts as solved
+(currently \code{COVERAGE\_THRESHOLD}~$= 0.98$; note the design note text says $0.95$, and
+the two should be reconciled). Let $K_{\max}$ be the guard budget (currently
+\code{MAX\_GUARDS}~$=20$; \cref{sec:calib} recommends $24$ to leave room for
+saturation) and $T_{\max}$ the step budget. An episode ends when
+
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+\textbf{Event} & \textbf{Flag} & \textbf{Condition} \\
+\midrule
+Solved            & \code{terminated} & $c_t \ge c^{\dagger}$ \emph{and} the agent has no pending pruning budget \\
+Committed         & \code{terminated} & $\mu_t = \STOP$ \\
+Guard budget spent& \code{truncated}  & $k_t \ge K_{\max}$ \\
+Step budget spent & \code{truncated}  & $t \ge T_{\max}$ \\
+Stalled           & \code{truncated}  & $\rho$ consecutive unproductive steps \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+A step is \emph{unproductive} if $\delta^{+} < \eta \cdot u_{t-1}$, i.e.\ the new guard
+covers less than a fraction $\eta$ (\code{USEFUL\_AREA\_FRAC}~$= 0.10$) of what was still
+uncovered; the threshold is relative to the remaining gap, so the bar falls as the gallery
+fills. The patience is $\rho = $ \code{PATIENCE} $= 3$.
+
+\begin{remark}[Solved $\ne$ terminated, once pruning exists]\label{rem:noearlystop}
+In the add-only setting, terminating at $c_t \ge c^\dagger$ is correct. Once $\DEL$
+exists it is not: the interesting part of the episode --- removing the guards that
+saturation made redundant --- happens \emph{after} the threshold is first crossed.
+In \stageII{} and \stageIII{} the episode therefore continues past first coverage and ends
+on $\STOP$ or on the step budget, with $\STOP$ carrying a penalty when $c_t < c^\dagger$.
+This is the reason the $\STOP$ action exists at all: it lets the agent choose the episode
+length, and \cref{prop:telescope} shows a shorter episode is (weakly) preferred whenever
+$\gamma < 1$.
+\end{remark}
+
+\begin{remark}[Truncation must bootstrap]\label{rem:bootstrap}
+All three of the truncation conditions above end an episode at a \emph{non-absorbing}
+state whose value is genuinely non-zero. Stable-Baselines3 only bootstraps the value at
+such a state when the environment sets \code{info["TimeLimit.truncated"] = True}
+\cite{raffin2021sb3}; the current environment does not, so every truncated episode is
+treated as terminal and its return is systematically underestimated. Combined with a
+negative per-guard cost this creates a real incentive to stall into the patience
+truncation. This is a concrete bug to fix alongside the reward redesign.
+\end{remark}
+
+\subsection{Discount}
+
+$\gamma$ is a design parameter, not a property of the problem. Episodes are short
+($\le 40$ steps), so a discount close to $1$ is affordable and desirable: the terminal
+parsimony payoff must survive back-propagation across the whole episode. We use
+$\gamma = 0.99$ in \stageI{} and $\gamma = 0.997$ in \stageII{}/\stageIII{}. Note the
+contrast with the locomotion papers, which run $50$\,Hz control and thousands of steps per
+episode and therefore use $\gamma = 0.994$ \cite{wang2025dribble} or $\gamma = 0.995$
+\cite{wang2025vision} --- effective horizons of only a few seconds. Those numbers should
+\emph{not} be copied across; here a step is a guard, not $20$\,ms.
+
+% ===========================================================================
+\section{Observation: a POMDP with a privileged critic}\label{sec:obs}
+% ===========================================================================
+
+The agent does not receive $s_t$. It receives a rasterised, bounded-size view, which makes
+the learning problem a POMDP \cite{kaelbling1998pomdp}. Following the asymmetric
+actor--critic pattern \cite{pinto2018asymmetric} used by all three reference papers ---
+\citet{wang2025dribble} give the critic simulator state and a wider first layer
+($768$ vs.\ $512$); \citet{wang2025vision} and \citet{xu2025striker} both publish an explicit
+actor/critic column table --- we let the critic see strictly more than the actor.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Observation specification. The actor input is the deployable view; the critic
+additionally receives privileged quantities that are exact but expensive or
+non-generalisable. $H = W = 64$ (\code{IMG\_SIZE}).}
+\label{tab:obs}
+\begin{tabularx}{\linewidth}{@{}l c X c c@{}}
+\toprule
+\textbf{Component} & \textbf{Shape} & \textbf{Description} & \textbf{Actor} & \textbf{Critic} \\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Raster channels, $H\times W$ each, \code{uint8}}}\\
+\code{interior}   & $H\times W$ & $\Ind{\text{pixel} \in \Free}$ & \checkmark & \checkmark \\
+\code{covered}    & $H\times W$ & $\Ind{\text{pixel} \in \Cov_t}$ & \checkmark & \checkmark \\
+\code{remaining}  & $H\times W$ & $\Ind{\text{pixel} \in \Unc_t}$ & \checkmark & \checkmark \\
+\code{guards}     & $H\times W$ & Gaussian splat of $\Guards_t$ & \checkmark & \checkmark \\
+\code{redundancy} & $H\times W$ & at pixel of $g_j$: $255\cdot\min(1,\delta^-_j/\sigma_p)$ & \checkmark & \checkmark \\
+\code{exclusive}  & $H\times W$ & region seen by exactly one guard & & \checkmark \\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Scalars}}\\
+$c_t$                     & $1$ & coverage fraction & \checkmark & \checkmark \\
+$k_t / K_{\max}$          & $1$ & guard budget used & \checkmark & \checkmark \\
+$t / T_{\max}$            & $1$ & step budget used & \checkmark & \checkmark \\
+$\min_j \delta^-_j$       & $1$ & cheapest available deletion & \checkmark & \checkmark \\
+$\bar{c}_t - c_t$         & $1$ & slack against the coverage ratchet & \checkmark & \checkmark \\
+$u_t$ (exact)             & $1$ & exact uncovered fraction (not raster) & & \checkmark \\
+$k_{\mathrm{ref}}$        & $1$ & greedy reference guard count & & \checkmark \\
+difficulty tier           & $4$ & one-hot & & \checkmark \\
+$n$, $m$                  & $2$ & vertex count, hole count & & \checkmark \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\Cref{tab:obs} extends the current three-channel image in two ways that the pruning stage
+requires. The \code{guards} channel is needed because the union $\Cov_t$ is
+indistinguishable between one guard and five guards covering the same region --- the
+existing \code{stats} vector was added for precisely this reason, but a scalar count
+cannot tell the policy \emph{where} the guards are, so a $\DEL$ head has nothing to point
+at. The \code{redundancy} channel makes $\delta^-_j$ directly legible: a bright guard is
+expensive to delete, a dark one is nearly free. Without it, the policy would have to infer
+each guard's exclusive area from the raster, which is exactly the kind of latent quantity
+that \citet{wang2025vision} found had to be supplied or explicitly reconstructed --- their
+ablation showed that a decoder trained \emph{after} RL rather than jointly left ball-position
+predictions ``at the noise level''.
+
+\takeaway{%
+\textbf{Design rule (observability of the pruning signal).} If the reward depends on
+$\delta^-_j$, the observation must expose $\delta^-_j$. Otherwise the $\DEL$ head is being
+asked to solve a credit-assignment problem the perception cannot support, and the stage-II
+gradient will be dominated by noise.}
+
+The privileged $k_{\mathrm{ref}}$ deserves a note: it is the guard count produced by a
+greedy max-coverage baseline on the same instance, computed once at dataset generation
+time. It gives the critic an instance-difficulty normaliser --- a hard $40$-vertex gallery
+with $12$ holes simply needs more guards than an easy one, and without $k_{\mathrm{ref}}$ the
+value function has to learn that from the raster. It also calibrates the terminal
+parsimony reward in \cref{sec:calib}. Note that $k_{\mathrm{ref}}$ must stay out of the
+\emph{actor} observation, or the policy will not generalise to instances with no
+precomputed baseline.
+
+% ===========================================================================
+\section{Reward}\label{sec:reward}
+% ===========================================================================
+
+\subsection{The objective we actually want}
+
+The AGP objective is terminal and sparse:
+\begin{equation}\label{eq:trueobj}
+  \max_{\pi}\;
+  \Ex_{\Gallery \sim \Dctx,\ \tau \sim \pi}
+  \Bigl[\, w_{\mathrm{goal}}\,\Ind{c_T \ge c^{\dagger}} \;-\; w_{\mathrm{par}}\, k_T \,\Bigr].
+\end{equation}
+Everything else in this section exists to make \eqref{eq:trueobj} learnable without
+changing what it prefers.
+
+\subsection{Two potentials}
+
+\begin{definition}[Coverage and parsimony potentials]
+\[
+  \Pot_{\mathrm{cov}}(s) \;=\; -\,w_{\mathrm{cov}}\, u(s) \;=\; -\,w_{\mathrm{cov}}\,\bigl(1 - f(\Guards(s))\bigr),
+  \qquad
+  \Pot_{\mathrm{par}}(s) \;=\; -\,w_{\mathrm{par}}\, k(s).
+\]
+The associated shaping rewards are $F_\bullet(s,a,s') = \gamma\,\Pot_\bullet(s') - \Pot_\bullet(s)$.
+\end{definition}
+
+Evaluating $F_{\mathrm{cov}}$ and $F_{\mathrm{par}}$ at $\gamma = 1$ gives a pleasant surprise:
+they reproduce exactly the reward terms one would write by hand.
+\[
+  F_{\mathrm{cov}} =
+  \begin{cases}
+    +\,w_{\mathrm{cov}}\,\delta^{+}, & \mu = \ADD, \\
+    -\,w_{\mathrm{cov}}\,\delta^{-}_{j^\star}, & \mu = \DEL,
+  \end{cases}
+  \qquad\qquad
+  F_{\mathrm{par}} =
+  \begin{cases}
+    -\,w_{\mathrm{par}}, & \mu = \ADD, \\
+    +\,w_{\mathrm{par}}, & \mu = \DEL.
+  \end{cases}
+\]
+So ``reward new area, charge for each guard, charge for area lost on deletion, refund the
+guard cost on deletion'' is not four hand-tuned terms --- it is two potentials. The
+requested reward structure (``adding guards is a negative reward, removing them with no
+space lost is a positive reward, with lower reward as space is lost'') falls out of
+$F_{\mathrm{cov}} + F_{\mathrm{par}}$ with a single free parameter, the ratio
+$w_{\mathrm{par}}/w_{\mathrm{cov}}$.
+
+\begin{theorem}[Policy invariance, Ng et al.\ \cite{ng1999}]\label{thm:ng}
+Let $\Mdp' $ be $\Mdp$ with reward $r' = r + \gamma\Pot(s') - \Pot(s)$ for any bounded
+$\Pot: \Sspace \to \Real$. If $\Pot$ vanishes at absorbing states, then every optimal policy
+of $\Mdp'$ is optimal in $\Mdp$ and vice versa.
+\end{theorem}
+
+\begin{proposition}[The dense reward telescopes into the sparse objective]\label{prop:telescope}
+Along any trajectory of length $T$ starting from $s_0 = (\Gallery,\emptyset,0,0)$,
+\[
+  \sum_{t=0}^{T-1} \gamma^{t}\bigl(\gamma\Pot(s_{t+1}) - \Pot(s_t)\bigr)
+  \;=\; \gamma^{T}\Pot(s_T) - \Pot(s_0).
+\]
+With $\Pot = \Pot_{\mathrm{cov}} + \Pot_{\mathrm{par}}$ and $\gamma = 1$ this equals
+\[
+  \bigl(-w_{\mathrm{cov}} u_T - w_{\mathrm{par}} k_T\bigr) - \bigl(-w_{\mathrm{cov}} \cdot 1 - 0\bigr)
+  \;=\; w_{\mathrm{cov}}\, c_T \;-\; w_{\mathrm{par}}\, k_T .
+\]
+Hence the undiscounted episode return under the dense reward, plus the terminal bonus, is
+exactly
+\[
+  R(\tau) \;=\; w_{\mathrm{cov}}\,c_T \;-\; w_{\mathrm{par}}\,k_T \;+\; w_{\mathrm{goal}}\Ind{c_T \ge c^{\dagger}}
+  \;+\; \underbrace{\textstyle\sum_t \gamma^t r^{\mathrm{aux}}_t}_{\text{auxiliary terms}} .
+\]
+For $\gamma < 1$ the shaping contributes $\gamma^T \Pot(s_T) - \Pot(s_0)$ instead, which
+additionally discounts the terminal potential by $\gamma^T$ and thus adds a mild preference
+for short episodes --- a pressure towards fewer guards, and towards using $\STOP$ promptly.
+\end{proposition}
+
+\begin{proof}
+The sum telescopes: $\sum_{t} \gamma^{t+1}\Pot(s_{t+1}) - \sum_t \gamma^t \Pot(s_t)
+= \gamma^T\Pot(s_T) - \Pot(s_0)$. Substituting $u_0 = 1$, $k_0 = 0$ gives the stated value.
+\end{proof}
+
+\Cref{prop:telescope} is the central design claim of this document. The dense, per-step
+signal that PPO needs is not an approximation of the sparse AGP objective; it is an exact
+decomposition of it. This is the same principle \citet{wang2025vision} rely on when they
+write that potential-based shaping ``guarantees that the learned behaviors remain directed
+toward successful goal scoring'', and it is what lets them give a dense proxy a weight of
+$500$ against a terminal goal reward of $15$ without corrupting the objective. It also
+means we do \emph{not} need to anneal the coverage term away in \stageII{}, unlike
+\citet{wang2025dribble}, who halve their chasing proxy ($2.0 \to 1.0$) precisely because it
+is \emph{not} potential-based and does bias the optimum.
+
+\subsection{Which terms must be annealed}
+
+\begin{designrule}[Anneal iff non-potential]\label{rule:anneal}
+A reward term may be left at a constant weight for the whole of training if and only if it
+is expressible as $\gamma\Pot(s')-\Pot(s)$ for a state function $\Pot$, or it is a
+component of the true objective \eqref{eq:trueobj}. Every other term biases the optimum and
+must be scheduled to zero before training ends.
+\end{designrule}
+
+This gives an objective criterion for something the reference papers do by hand. In
+\citet{wang2025dribble}, the reference-motion imitation reward is dropped $1.2 \to 0.0$ with
+the stated reason that it is ``removed to promote exploration and discovery of effective
+dribbling behaviors''; in \citet{xu2025striker}, feet-swing ($3.0 \to 0.0$), arm-swing
+($1.0 \to 0.0$) and feet-yaw ($-1.0 \to 0.0$) are all zeroed at the stage boundary. All of
+these are non-potential shaping terms and all of them are annealed; the terms those papers
+keep alive are the ones closest to the task objective. \Cref{rule:anneal} says the pattern
+is not a coincidence.
+
+Under this rule our terms split as in \cref{tab:invariance}.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Classification of reward terms. Only the last group needs a schedule.}
+\label{tab:invariance}
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+\textbf{Class} & \textbf{Terms} & \textbf{Treatment} \\
+\midrule
+Objective        & $r_{\mathrm{goal}}$, $r_{\mathrm{pars}}$, $r_{\mathrm{fail}}$ & fixed weights, on from \stageI{} \\
+Potential-based  & $F_{\mathrm{cov}}$, $F_{\mathrm{par}}$ & fixed weights; $F_{\mathrm{par}}$ off in \stageI{} only because the $\DEL$ action is masked \\
+Non-potential    & $r_{\mathrm{front}}$, $r_{\mathrm{sweep}}$, $r_{\mathrm{sep}}$ & annealed to $0$ by the end of \stageI{} \\
+Constraint-like  & $r_{\mathrm{proj}}$, $r_{\mathrm{void}}$, $r_{\mathrm{stop}}$ & fixed; promoted to hard constraints in \stageIII{} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{The reward basis}
+
+\begin{table}[t]
+\centering
+\small
+\caption{The reward basis. One environment, one term list; the curriculum changes only the
+weight column (Document 2). ``Fires'' indicates when the term is non-zero.
+$\sigma_p$ is the pruning tolerance scale, $\sigma_s$ the sweep width, $d_{\min}$ the
+separation radius, $\iota_t$ the projection indicator, $k_{\mathrm{ref}}$ the greedy
+reference count.}
+\label{tab:basis}
+\renewcommand{\arraystretch}{1.35}
+\begin{tabularx}{\linewidth}{@{}l l X l@{}}
+\toprule
+\textbf{Symbol} & \textbf{Name} & \textbf{Expression} & \textbf{Fires} \\
+\midrule
+\rowcolor{agpgrey}
+\multicolumn{4}{@{}l}{\emph{Objective group (coverage critic)}}\\
+$r_{\mathrm{cov}}$  & coverage potential & $\gamma\Pot_{\mathrm{cov}}(s') - \Pot_{\mathrm{cov}}(s)$; equals $+\delta^{+}$ on $\ADD$, $-\delta^{-}_{j^\star}$ on $\DEL$ (at $\gamma{=}1$) & every step \\
+$r_{\mathrm{goal}}$ & coverage attained  & $\Ind{c_T \ge c^{\dagger}}$ & terminal \\
+$r_{\mathrm{fail}}$ & coverage missed    & $-\Ind{c_T < c^{\dagger}}$ & terminal \\
+\midrule
+\rowcolor{agpgrey}
+\multicolumn{4}{@{}l}{\emph{Parsimony group (parsimony critic)}}\\
+$r_{\mathrm{par}}$   & guard-count potential & $\gamma\Pot_{\mathrm{par}}(s') - \Pot_{\mathrm{par}}(s)$; equals $-1$ on $\ADD$, $+1$ on $\DEL$ & every step \\
+$r_{\mathrm{prune}}$ & clean-prune bonus     & $\exp\!\bigl(-\delta^{-}_{j^\star}/\sigma_p\bigr) \in (0,1]$ & $\DEL$ \\
+$r_{\mathrm{pars}}$  & terminal parsimony    & $\bigl(k_{\mathrm{ref}} - k_T\bigr)\,\Ind{c_T \ge c^{\dagger}}$ & terminal \\
+\midrule
+\rowcolor{agpgrey}
+\multicolumn{4}{@{}l}{\emph{Scaffolding group --- annealed to zero (\cref{rule:anneal})}}\\
+$r_{\mathrm{front}}$ & frontier bonus       & $\Ind{\proj(\xi) \in \Unc_t}$ & $\ADD$ \\
+$r_{\mathrm{sweep}}$ & boundary-inward prior& $\exp\!\bigl(-(\dbd(\proj(\xi)) - \mu_{\mathrm{ring}}(t))^2 / 2\sigma_s^2\bigr)$ & $\ADD$ \\
+$r_{\mathrm{sep}}$   & separation penalty   & $-\Ind{\min_j \lVert \proj(\xi) - g_j\rVert < d_{\min}}$ & $\ADD$ \\
+\midrule
+\rowcolor{agpgrey}
+\multicolumn{4}{@{}l}{\emph{Regularity group --- constraints in \stageIII{}}}\\
+$r_{\mathrm{proj}}$  & aimed outside $\Free$ & $-\iota_t$ & $\ADD$ \\
+$r_{\mathrm{void}}$  & deleted from empty set& $-\Ind{\Guards_t = \emptyset}$ & $\DEL$ \\
+$r_{\mathrm{stop}}$  & premature commit      & $-\Ind{c_t < c^{\dagger}}$ & $\STOP$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\Cref{tab:basis} lists every term. Three remarks on the less obvious entries.
+
+\paragraph{$r_{\mathrm{prune}}$ and the ``lower reward as space is lost'' requirement.}
+The bounded exponential kernel $\exp(-\delta^{-}/\sigma_p)$ equals $1$ for a strictly
+redundant guard and decays smoothly to $0$ as the deletion becomes expensive. Bounding
+each shaping term in $(0,1]$ is the single most consistent stylistic choice across the
+reference papers --- \citet{wang2025dribble} write \emph{every} tracking reward as
+$\exp\{-\alpha\lVert x - x^\star\rVert^2\}$, and \citet{xu2025striker} use
+$\exp(-(v^{\mathrm{target}}-v)^2/\sigma)$. The practical payoff is that a weight then \emph{is}
+the term's maximum per-step contribution, which makes hand-balancing a dozen terms
+tractable. Note that $r_{\mathrm{prune}}$ is technically non-potential and therefore does bias
+the optimum; it survives \cref{rule:anneal} only because the bias is negligible
+($\sigma_p \ll 1$, so it is effectively a delta function at $\delta^- \approx 0$, i.e.\ a
+tie-breaker among genuinely free deletions). If purity is preferred, it can be annealed
+with the scaffolding group.
+
+\paragraph{$r_{\mathrm{sweep}}$ and the ``edges first, then inwards'' idea.}
+The ring target
+\begin{equation}\label{eq:ring}
+  \mu_{\mathrm{ring}}(t) \;=\; \mu_0 + (\mu_1 - \mu_0)\,\frac{t}{K_{\max}},
+  \qquad 0 \le \mu_0 < \mu_1 ,
+\end{equation}
+sweeps the preferred distance-to-boundary outward-to-inward \emph{within} an episode: early
+guards are rewarded for sitting near $\partial\Free$ (where reflex vertices and hole
+boundaries create the occlusions), later ones for moving into the interior. This is a prior
+on the \emph{order} of placement, not on the final configuration, and it is the AGP analogue
+of the gait-phase indicators (\code{feet swing} $\times$ \code{swing period}) that
+\citet{xu2025striker} use to install a walking rhythm and then delete. Both $\mu_0,\mu_1$
+should be expressed as fractions of the bounding-box diagonal so the term is scale-free.
+An alternative formulation replaces $\dbd$ by distance to the nearest reflex vertex,
+$\min_{v \in \Reflex}\lVert \cdot - v\rVert$, which is better motivated by the geometry
+(reflex vertices are exactly the sources of occlusion, and are what makes $\lfloor n/3\rfloor$
+tight \cite{chvatal1975,orourke1987}) but requires computing $\Reflex$ per instance.
+
+\paragraph{$r_{\mathrm{pars}}$ and calibration against a reference solver.}
+Rewarding $-k_T$ directly makes the terminal reward's scale instance-dependent: an easy
+gallery needs $3$ guards, an extreme one $15$, so the same $-k_T$ means very different
+things. Measuring against the greedy baseline, $(k_{\mathrm{ref}} - k_T)$, normalises this and
+gives a directly interpretable quantity --- ``guards saved relative to greedy''. This
+mirrors \citet{xu2025striker}, who set their constraint threshold to
+``$1.5\times$ per-step average regularization cost of a walking gait'', i.e.\ calibrated
+against a known-good reference behaviour rather than in absolute units.
+
+\subsection{Weight calibration}\label{sec:calib}
+
+Three inequalities determine the weights; everything else is tuning.
+
+\paragraph{(C1) The guard--area exchange rate.}
+The ratio
+\begin{equation}\label{eq:exchange}
+  \epsilon \;=\; \frac{w_{\mathrm{par}}}{w_{\mathrm{cov}}}
+\end{equation}
+is the fraction of gallery area that one guard is worth. It is the single most
+interpretable hyperparameter in the whole design, and it should be set from the problem,
+not by sweeping: if a typical solved instance uses $k_{\mathrm{typ}}$ guards, then
+$\epsilon \approx 1/(2 k_{\mathrm{typ}})$ says ``a guard is worth half of its fair share of
+the gallery'', which keeps coverage dominant while still making redundancy expensive.
+With $k_{\mathrm{typ}} \approx 8$--$12$ across the four tiers we take $\epsilon = 0.02$,
+i.e.\ $w_{\mathrm{cov}} = 1.0$, $w_{\mathrm{par}} = 0.02$.
+
+\paragraph{(C2) Feasibility must dominate parsimony.}
+The agent must never prefer a smaller infeasible solution to a larger feasible one. Since
+at most $K_{\max}$ guards can be placed, it suffices that
+\begin{equation}\label{eq:dominance}
+  w_{\mathrm{goal}} \;+\; w_{\mathrm{fail}} \;>\; w_{\mathrm{par}}\,K_{\max}
+  \;+\; w_{\mathrm{pars}}\,k_{\mathrm{ref}}^{\max}.
+\end{equation}
+With $w_{\mathrm{par}} = 0.02$, $K_{\max} = 24$, $w_{\mathrm{pars}} = 0.25$ and
+$k_{\mathrm{ref}}^{\max} \approx 18$ the right-hand side is $\approx 4.98$, so
+$w_{\mathrm{goal}} = 4.0$ and $w_{\mathrm{fail}} = 2.0$ satisfy \eqref{eq:dominance} with margin.
+This is the AGP analogue of \citet{wang2025vision} setting their fall penalty to $-1000$
+against task rewards of order $10$--$500$: the hard-failure term is deliberately off-scale.
+
+\paragraph{(C3) The pruning tolerance.}
+A deletion is immediately profitable when
+\[
+  w_{\mathrm{par}} + w_{\mathrm{prune}}\exp\!\bigl(-\delta^{-}/\sigma_p\bigr)
+  \;>\; w_{\mathrm{cov}}\,\delta^{-}.
+\]
+The left side is decreasing in $\delta^-$ and the right side increasing, so there is a
+unique root $\epsilon^{\star}$ --- the \emph{pruning tolerance}, the largest coverage loss
+the agent will accept in exchange for one fewer guard:
+\begin{equation}\label{eq:tolerance}
+  \epsilon^{\star}
+  \;=\; \frac{w_{\mathrm{par}}}{w_{\mathrm{cov}}}
+      + \frac{w_{\mathrm{prune}}}{w_{\mathrm{cov}}}\,e^{-\epsilon^{\star}/\sigma_p}
+  \;\approx\; \epsilon \;+\; \frac{w_{\mathrm{prune}}}{w_{\mathrm{cov}}}\,e^{-\epsilon/\sigma_p}
+  \quad\text{when } \sigma_p \ll \epsilon .
+\end{equation}
+With $w_{\mathrm{cov}} = 1.0$, $w_{\mathrm{par}} = 0.02$, $w_{\mathrm{prune}} = 0.15$,
+$\sigma_p = 0.005$, the root is $\epsilon^{\star} \approx 0.022$: the agent will trade away
+up to about $2.2\%$ of the gallery to remove a guard, and essentially nothing beyond that.
+Note that $\epsilon^\star$ is dominated by the exchange rate $\epsilon$, which is the
+intended behaviour --- the exponential bonus only breaks ties among nearly-free deletions.
+The hard feasibility floor is enforced separately by the ratchet of
+\cref{sec:constraints}, so $\epsilon^\star$ governs \emph{intermediate} states, not the
+final answer.
+
+\paragraph{Default values.}
+\begin{center}
+\small
+\begin{tabular}{@{}l l l@{}}
+\toprule
+\textbf{Symbol} & \textbf{Value} & \textbf{Set by} \\
+\midrule
+$w_{\mathrm{cov}}$    & $1.0$   & normalisation (defines the unit of reward) \\
+$w_{\mathrm{par}}$    & $0.02$  & (C1), exchange rate $\epsilon = 1/(2k_{\mathrm{typ}})$ \\
+$w_{\mathrm{goal}}$   & $4.0$   & (C2) \\
+$w_{\mathrm{fail}}$   & $2.0$   & (C2) \\
+$w_{\mathrm{pars}}$   & $0.25$  & (C2), scale of ``guards saved vs.\ greedy'' \\
+$w_{\mathrm{prune}}$  & $0.15$  & (C3) \\
+$\sigma_p$            & $0.005$ & (C3), $0.5\%$ of gallery area counts as ``no space lost'' \\
+$\epsilon^{\star}$    & $0.022$ & derived from (C1)+(C3) \\
+$c^{\dagger}$         & $0.98$  & task specification \\
+$K_{\max}$            & $24$    & budget; must exceed $k_{\mathrm{ref}}^{\max}$ with slack for saturation \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Reward groups and the multi-critic split}
+
+The rows of \cref{tab:basis} are grouped so that each group can be given its own value
+head, following \citet{wang2025vision}, who report that ``using a single critic to estimate
+combined rewards can cause negative interference between distinct reward components,
+leading to reduced learning stability and performance'' and combine advantages as
+$\Adv_{\mathrm{total}} = w_{\mathrm{goal}}\Adv_{\mathrm{goal}} + w_{\mathrm{aux}}\Adv_{\mathrm{aux}}$
+with weights $2$ and $1$. Our split is
+\begin{equation}\label{eq:multicritic}
+  \Adv_{\mathrm{total}}
+  \;=\; \beta_{\mathrm{cov}}\,\Adv_{\mathrm{cov}}
+  \;+\; \beta_{\mathrm{par}}\,\Adv_{\mathrm{par}}
+  \;+\; \beta_{\mathrm{reg}}\,\Adv_{\mathrm{reg}} ,
+\end{equation}
+with the coverage group, the parsimony group, and the scaffolding-plus-regularity group
+respectively. The reason this matters here is scale: $r_{\mathrm{cov}}$ has per-step
+magnitude up to $\sim 0.5$ early in an episode and $\sim 10^{-3}$ late, while
+$r_{\mathrm{par}}$ is a constant $\pm 0.02$. A single critic must fit both regimes with one
+output head; two heads need not. The stage-dependent $\beta$ schedule is set in Document 2.
+
+% ===========================================================================
+\section{Constraints}\label{sec:constraints}
+% ===========================================================================
+
+Two requirements are better expressed as constraints than as reward terms, giving a
+constrained MDP \cite{altman1999}.
+
+\paragraph{Validity.} $g \in \Free$ for every placed guard. This is enforced structurally
+by $\proj$ (\cref{eq:proj}), with $r_{\mathrm{proj}}$ retained as a soft penalty so the policy
+still learns to aim inside rather than relying on the projection.
+
+\paragraph{The coverage ratchet.} Once the agent has achieved coverage $\bar{c}_t$ it
+should not be allowed to fall back arbitrarily far while pruning:
+\begin{equation}\label{eq:ratchet}
+  c_t \;\ge\; \min\bigl(\bar{c}_t,\ c^{\dagger}\bigr) - \delta_{\mathrm{slack}},
+  \qquad \delta_{\mathrm{slack}} = 0.01 .
+\end{equation}
+In \stageII{} this is implemented as an \emph{action mask}: a $\DEL$ whose
+$\delta^{-}_{j^\star}$ would violate \eqref{eq:ratchet} is rejected and charged
+$r_{\mathrm{void}}$. In \stageIII{} it is promoted to a state-wise constraint solved with a
+constrained policy-gradient method:
+\begin{equation}\label{eq:statewise}
+  \max_\pi\; \Ex\Bigl[\textstyle\sum_t \gamma^t r^{\mathrm{task}}_t\Bigr]
+  \quad\text{s.t.}\quad
+  c^{\mathrm{cost}}(s_t, a_t) \le h \quad \forall (s_t,a_t) \in \tau,\ \tau \sim p_\pi .
+\end{equation}
+\Cref{eq:statewise} is the formulation \citet{xu2025striker} adopt (their Eqs.~4--5, solved
+with N-P3O \cite{lee2023constrained}), and their motivation transfers directly. They
+diagnose \emph{inhomogeneous credit assignment}: task reward is concentrated at one
+moment of the episode (the kick), so ``a fixed regularization coefficient can impose
+disproportionately large penalties at certain steps --- particularly those immediately
+preceding the kick, where the agent expects high immediate future reward''. Their ablation
+is the strongest part of the argument: raising the fixed coefficient from $1.0$ to $1.5$
+\emph{lowered} success from $64.8\%$ to $43.4\%$, while the constrained formulation reached
+$79.5\%$. AGP has exactly the same profile --- the first few guards each capture a large
+share of the area and the last ones capture slivers, so any fixed per-step penalty is
+mis-scaled at one end of the episode or the other.
+
+% ===========================================================================
+\section{The environment step, in full}
+% ===========================================================================
+
+\begin{algorithm}[h]
+\small
+\caption{One environment step of $\Mdp$}
+\begin{algorithmic}[1]
+\Require state $s_t = (\Gallery, \Guards_t, t, \bar c_t)$, action $(\mu, a)$, stage weight vector $w$
+\State $\xi \gets \xi(a)$ \Comment{decode into gallery coordinates}
+\If{$\mu = \STOP$}
+  \State \Return $s_t$, $r = w_{\mathrm{stop}}\,r_{\mathrm{stop}} + \textsc{Terminal}(s_t)$, \code{terminated}
+\ElsIf{$\mu = \ADD$}
+  \State $\iota \gets \Ind{\xi \notin \operatorname{int}\Free}$; \; $g \gets \proj(\xi)$
+  \State $\delta^{+} \gets \nu(\Vis(g) \setminus \Cov_t)$ \Comment{exact, via Shapely difference}
+  \State $\Guards_{t+1} \gets \Guards_t \oplus g$; \; cache $\Vis(g)$
+  \State $r \gets w_{\mathrm{cov}}\delta^{+} - w_{\mathrm{par}} + w_{\mathrm{front}} r_{\mathrm{front}} + w_{\mathrm{sweep}} r_{\mathrm{sweep}} + w_{\mathrm{sep}} r_{\mathrm{sep}} - w_{\mathrm{proj}}\iota$
+\Else \Comment{$\mu = \DEL$}
+  \If{$\Guards_t = \emptyset$} \State \Return $s_t$, $r = -w_{\mathrm{void}}$, continue \EndIf
+  \State $j^\star \gets \arg\min_j \lVert g_j - \xi\rVert_2$; \; $\delta^{-} \gets f(\Guards_t) - f(\Guards_t \ominus g_{j^\star})$
+  \If{$f(\Guards_t) - \delta^{-} < \min(\bar c_t, c^{\dagger}) - \delta_{\mathrm{slack}}$}
+     \State \Return $s_t$, $r = -w_{\mathrm{void}}$, continue \Comment{ratchet violation, masked}
+  \EndIf
+  \State $\Guards_{t+1} \gets \Guards_t \ominus g_{j^\star}$
+  \State $r \gets -w_{\mathrm{cov}}\delta^{-} + w_{\mathrm{par}} + w_{\mathrm{prune}}\exp(-\delta^{-}/\sigma_p)$
+\EndIf
+\State $c_{t+1} \gets f(\Guards_{t+1})$; \; $\bar c_{t+1} \gets \max(\bar c_t, c_{t+1})$
+\State evaluate termination (\cref{sec:term}); on terminal add $\textsc{Terminal}(s_{t+1})$
+\State \textbf{on truncation:} set \code{info["TimeLimit.truncated"] = True} \Comment{\cref{rem:bootstrap}}
+\State \Return $s_{t+1}$, $r$, flags
+\Statex
+\Function{Terminal}{$s$}
+  \State \Return $w_{\mathrm{goal}}\Ind{c \ge c^{\dagger}} - w_{\mathrm{fail}}\Ind{c < c^{\dagger}} + w_{\mathrm{pars}}(k_{\mathrm{ref}} - k)\Ind{c \ge c^{\dagger}}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[scale=0.92]
+  \def\gal{(0,0) -- (4.2,0) -- (4.2,1.4) -- (2.7,1.4) -- (2.7,2.5) -- (4.2,2.5) -- (4.2,4.0) -- (1.6,4.0) -- (1.6,3.0) -- (0,3.0) -- cycle}
+  \def\hole{(0.7,0.7) rectangle (1.7,1.7)}
+
+  % ---- panel (a)
+  \begin{scope}[xshift=0cm]
+    \fill[even odd rule, agpgrey] \gal \hole;
+    \draw[thick, agpblue] \gal;
+    \draw[thick, agpblue] \hole;
+    \node[below] at (2.1,-0.35) {\small (a) $s_0$: empty gallery};
+  \end{scope}
+
+  % ---- panel (b)
+  \begin{scope}[xshift=5.4cm]
+    \fill[even odd rule, agpgrey] \gal \hole;
+    \draw[thick, agpblue] \gal;
+    \draw[thick, agpblue] \hole;
+    \foreach \p in {(0.3,0.3),(0.3,2.7),(1.9,3.7),(3.9,3.7),(3.9,2.7),(3.9,0.3),(2.4,0.3),(2.1,2.1),(1.1,2.4),(3.0,1.7)}
+      \fill[agpaccent] \p circle (2.6pt);
+    \node[below] at (2.1,-0.35) {\small (b) \stageI{}: saturate, $k=10$};
+  \end{scope}
+
+  % ---- panel (c)
+  \begin{scope}[xshift=10.8cm]
+    \fill[even odd rule, agpgrey] \gal \hole;
+    \draw[thick, agpblue] \gal;
+    \draw[thick, agpblue] \hole;
+    \foreach \p in {(0.3,0.3),(0.3,2.7),(1.9,3.7),(3.9,0.3),(3.0,1.7)}
+      \fill[agpgreen] \p circle (2.6pt);
+    \foreach \p in {(0.3,2.7),(3.9,3.7),(3.9,2.7),(2.4,0.3),(2.1,2.1),(1.1,2.4)}
+      \node[agpaccent, opacity=0.45] at \p {$\times$};
+    \node[below] at (2.1,-0.35) {\small (c) \stageII{}: prune, $k=5$};
+  \end{scope}
+\end{tikzpicture}
+\caption{The saturate-then-prune trajectory that the MDP is built to support.
+\Cref{prop:prune} says each guard's redundancy deficit $\delta^-_j$ is smallest in panel
+(b), so that is the state in which deletions (crosses in panel (c)) are cheapest and the
+pruning signal is least ambiguous.}
+\label{fig:pipeline}
+\end{figure}
+
+% ===========================================================================
+\section{Mapping onto the current implementation}
+% ===========================================================================
+
+\Cref{tab:mapping} places every reward term currently in \code{ppo\_agp.py} into the
+formalism above.
+
+\begin{table}[h]
+\centering
+\small
+\caption{The existing reward, classified. ``Invariant'' means the term does not change the
+optimal policy and may therefore keep a fixed weight (\cref{rule:anneal}).}
+\label{tab:mapping}
+\begin{tabularx}{\linewidth}{@{}l l c X@{}}
+\toprule
+\textbf{Code} & \textbf{Formal term} & \textbf{Invariant} & \textbf{Comment} \\
+\midrule
+\code{area\_term}      & $F_{\mathrm{cov}}$ on $\ADD$ & yes & already exactly $\delta^{+}$ \\
+\code{cost\_term}      & $F_{\mathrm{par}}$ on $\ADD$ & yes & $w_{\mathrm{par}} = $ \code{GUARD\_COST} $= 0.05$, i.e.\ $\epsilon = 0.05$ --- generous; (C1) suggests $0.02$ \\
+\code{placement\_term} & $r_{\mathrm{front}}$ & no & biases towards placing in uncovered spots even when a covered spot would see more; anneal \\
+\code{spacing\_term}   & $r_{\mathrm{sep}}$ & no & a fixed $15\%$-of-diagonal exclusion is wrong for corridors; anneal \\
+\code{invalid\_term}   & $r_{\mathrm{proj}}$ & (constraint) & keep \\
+--- & $r_{\mathrm{goal}}$, $r_{\mathrm{fail}}$, $r_{\mathrm{pars}}$ & --- & \textbf{absent}: no terminal reward of any kind \\
+--- & $r_{\mathrm{prune}}$, $\DEL$ & --- & \textbf{absent}: the action space has no removal \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Four gaps follow, in rough order of impact.
+
+\begin{enumerate}[label=\textbf{G\arabic*.},leftmargin=2.6em]
+  \item \textbf{No terminal reward.} \Cref{prop:telescope} shows the potential terms already
+        encode $w_{\mathrm{cov}}c_T - w_{\mathrm{par}}k_T$, but there is no
+        $\Ind{c_T \ge c^{\dagger}}$ term, so crossing the threshold is worth nothing beyond
+        the area itself. Combined with \textbf{G2} this makes giving up cheap.
+  \item \textbf{Truncation is treated as termination} (\cref{rem:bootstrap}). The patience
+        stall, the guard-budget exhaustion and the step limit all cut the episode at a
+        state with real remaining value, and none of them sets
+        \code{TimeLimit.truncated}. The value target is therefore biased low exactly on the
+        trajectories the agent should learn to avoid. This is a plausible contributor to the
+        training instability recorded in the design note ($\text{approx\_kl}$ in the tens,
+        $\text{clip\_fraction}\approx 0.8$, collapse after $150$--$200$k steps) --- not the
+        only one, but a cheap fix to rule out.
+  \item \textbf{No removal action}, so the pruning stage cannot be expressed. This is the
+        action-space extension of \cref{def:action}.
+  \item \textbf{The observation cannot support pruning} even if the action existed: guards
+        are not visible as individual objects and $\delta^{-}_j$ is not exposed
+        (\cref{tab:obs}).
+  \end{enumerate}
+
+A fifth, smaller item: \code{COVERAGE\_THRESHOLD} is $0.98$ in code and $0.95$ in the prose
+of \code{docs/agp\_ppo\_design.md}; the calibration in \cref{sec:calib} assumes $0.98$.
+
+% ===========================================================================
+\section{Evaluation metrics}
+% ===========================================================================
+
+The MDP return is a training signal, not a report. Evaluation on the held-out set should
+report, per difficulty tier:
+
+\begin{itemize}
+  \item \textbf{Feasibility rate} $\Prob[c_T \ge c^{\dagger}]$ --- the primary number.
+  \item \textbf{Mean coverage} $\Ex[c_T]$, including failures.
+  \item \textbf{Guard count} $\Ex[k_T \mid c_T \ge c^{\dagger}]$, conditioned on success so that
+        failures cannot flatter the count.
+  \item \textbf{Competitive ratio} $\Ex[k_T / k_{\mathrm{ref}}]$ against greedy, and against an
+        exact IP solution \cite{couto2011,tozoni2016} on the \code{easy} tier where one is
+        computable.
+  \item \textbf{Pruning yield} $\Ex[k_{\mathrm{peak}} - k_T]$: how many guards \stageII{} removes.
+        This is the quantity the whole second stage exists to increase, and it is zero by
+        construction for any add-only policy.
+  \item \textbf{Redundancy at termination} $\Ex[\#\{j : \delta^{-}_j < \sigma_p\}]$: strictly
+        redundant guards left behind. A well-pruned solution should have none.
+\end{itemize}
+
+Reporting $k_T$ without conditioning on feasibility is the easiest way to be fooled here: a
+policy that stops after two guards has an excellent guard count.
+
+% ===========================================================================
+\section{Summary}
+% ===========================================================================
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+  \item The AGP is modelled as a deterministic contextual MDP over gallery instances, with
+        state $(\Gallery, \Guards_t, t, \bar c_t)$ and action space
+        $\{\ADD,\DEL,\STOP\}\times[0,1]^2$, where $\DEL$ addresses a guard geometrically
+        rather than by index.
+  \item Coverage is a monotone submodular set function, so a guard's redundancy deficit can
+        only shrink as the gallery fills (\cref{prop:prune}). Saturating first and pruning
+        second is therefore the ordering in which the pruning signal is strongest.
+  \item The dense reward consists of exactly two potentials, on uncovered area and on guard
+        count. Their discounted sum telescopes into the true sparse objective
+        (\cref{prop:telescope}), so the dense signal is unbiased by construction and the
+        curriculum can reweight freely.
+  \item A term may keep a fixed weight iff it is potential-based or part of the objective
+        (\cref{rule:anneal}); this yields an explicit, principled list of which terms the
+        curriculum must anneal to zero, rather than the hand-chosen schedules used in the
+        reference papers.
+  \item Weights are fixed by three inequalities: the guard--area exchange rate
+        $\epsilon = w_{\mathrm{par}}/w_{\mathrm{cov}}$, feasibility dominance, and the pruning
+        tolerance $\epsilon^{\star}$, which comes out at about $2.2\%$ of gallery area for
+        the defaults.
+  \item The current implementation is the $\ADD$-only special case with no terminal reward,
+        two biasing shaping terms, and truncation handled as termination. All four gaps are
+        addressable without changing the environment's external interface.
+\end{enumerate}
+
+\bibliographystyle{plainnat}
+\renewcommand{\refname}{References}
+\bibliography{refs}
+
+\end{document}
