@@ -328,25 +328,41 @@ stages \cite{wang2025dribble}.
 
 \subsection{Potential-based shaping: dense reward without bias}\label{sec:shaping}
 
-PPO needs a dense signal, but dense rewards can change which policy is optimal. We avoid
-this by making the two dense terms potentials. Let $u(s) = 1 - f(S)$ and $k(s)=\lvert S\rvert$
-and define
+PPO needs a dense signal, but dense rewards can change which policy is optimal, and a
+reward paid per \emph{event} can be farmed by repeating the event. We avoid both by paying
+every dense term as the change of a function of the state. Let $u(s) = 1 - f(S)$,
+$k(s)=\lvert S\rvert$, and let
 \[
-  \Pot(s) \;=\; -w_{\mathrm{cov}}\,u(s) \;-\; w_{\mathrm{par}}\,k(s),
-  \qquad
-  F(s,s') = \gamma\Pot(s') - \Pot(s).
+  R(s) \;=\; \sum_{g_j \in S} \exp\!\bigl(-\hat\delta^-_j/\sigma_p\bigr), \qquad \sigma_p = 0.005,
 \]
-At $\gamma=1$, $F$ is exactly the per-step reward we pay: $+w_{\mathrm{cov}}\delta^+ -
-w_{\mathrm{par}}$ on $\ADD$ and $-w_{\mathrm{cov}}\delta^- + w_{\mathrm{par}}$ on $\DEL$. Along
-any episode from the empty gallery ($u_0=1$, $k_0=0$),
+be a soft count of redundant guards: a guard that sees nothing on its own counts as $1$, one
+that alone covers well over half a percent of the gallery counts as about $0$. Here
+$\hat\delta^-_j$ is the raster estimate of the exclusive area, the same quantity the agent
+sees in observation channel 4. Define
+\[
+  \Pot(s) \;=\; -w_{\mathrm{cov}}\,u(s) \;-\; w_{\mathrm{par}}\,k(s) \;-\; w_{\mathrm{prune}}\,R(s),
+  \qquad
+  F(s,s') = \Pot(s') - \Pot(s).
+\]
+$F$ is exactly the dense reward we pay. Its coverage and guard-count parts are
+$+w_{\mathrm{cov}}\delta^+ - w_{\mathrm{par}}$ on $\ADD$ and $-w_{\mathrm{cov}}\delta^- +
+w_{\mathrm{par}}$ on $\DEL$; its redundancy part $w_{\mathrm{prune}}(R(s)-R(s'))$ is paid on
+every step. Along any episode,
 \[
   \sum_{t=0}^{T-1} F(s_t,s_{t+1}) \;=\; \Pot(s_T) - \Pot(s_0)
-  \;=\; w_{\mathrm{cov}}\,c_T - w_{\mathrm{par}}\,k_T ,
+  \;=\; w_{\mathrm{cov}}\,c_T \;-\; w_{\mathrm{par}}\,k_T \;-\; w_{\mathrm{prune}}\,R(s_T) \;+\; \text{const},
 \]
-which is the objective itself. By the shaping theorem of \citet{ng1999}, adding $F$ does
-not change the optimal policy. We train with $\gamma=0.995$, for which the sum is
-$\gamma^T\Pot(s_T)-\Pot(s_0)$; the extra factor $\gamma^T$ mildly favours short episodes,
-i.e.\ fewer guards and a prompt $\STOP$, which is the direction we want anyway.
+where the constant depends only on the start state ($0$ from an empty gallery). The dense
+reward therefore depends only on \emph{where the episode ends}, not on the path to it:
+coverage reached, guards used, and how many of them are redundant. No sequence of actions
+can collect more than that endpoint is worth, so no dense term can be farmed. The potentials
+are differenced with $\gamma=1$ and the terminal state is not zeroed, so the endpoint value is
+part of the return rather than cancelled; it is exactly the objective of \cref{sec:collapse}
+(cover, with few guards, none of them redundant). The identity is exact for
+the undiscounted return. PPO discounts with $\gamma=0.995$, and episodes are at most 40
+steps long, so later terms are weighted by at least $0.995^{40}\approx0.82$: the shaping is
+close to, though not exactly, the discounted form $\gamma\Pot(s')-\Pot(s)$ whose policy
+invariance \citet{ng1999} prove.
 
 \begin{designrule}[Anneal iff non-potential]\label{rule:anneal}
 A reward term may keep a fixed weight for the whole of training only if it is a potential
@@ -354,9 +370,12 @@ difference or part of the objective. Any other term biases the optimum and must 
 before training ends.
 \end{designrule}
 
-\Cref{rule:anneal} decides the schedule in \cref{fig:curriculum}: the coverage and
-guard-count terms stay on, and the stage-1 scaffolds (frontier, sweep, separation) are
-annealed to zero.
+\Cref{rule:anneal} decides the schedule in \cref{fig:curriculum}. The coverage,
+guard-count and redundancy terms are potentials and keep their weights. The terminal terms
+are part of the objective. The regularity penalties ($w_{\mathrm{proj}}$, $w_{\mathrm{void}}$,
+$w_{\mathrm{stop}}$) only discourage actions that are never useful, so they cannot be farmed and
+change no optimum. The stage-1 scaffolds (frontier, sweep, separation) are the only terms
+that bias the solution, and they are annealed to zero.
 
 \begin{figure}[!htbp]
 \centering
@@ -760,7 +779,7 @@ each part precisely.
   \node[blk, text width=5.6cm] (obs) at (7.4,0) {\textbf{Observation}\\image $64{\times}64{\times}5$: interior, covered,\\uncovered, guards, redundancy\\5 stats: coverage, budget, time,\\cheapest deletion, ratchet room};
   \node[blk, text width=5.6cm] (pol) at (7.4,-3.0) {\textbf{Policy} (\cref{fig:net})\\action $a_t = [\mu, x, y]$};
   \node[blk, text width=5.6cm, fill=white] (env) at (0,-3.0) {\textbf{Environment step}\\$\ADD$: project into $\Free$, place a guard\\$\DEL$: remove the nearest guard,\\unless the ratchet refuses\\$\STOP$: end the episode};
-  \node[blk, text width=5.6cm, fill=agpaccent!12, draw=agpaccent] (rew) at (0,-5.9) {\textbf{Reward} $r_t$ (exact geometry)\\potentials for coverage and guards,\\scaffolds, penalties, terminal bonus};
+  \node[blk, text width=5.6cm, fill=agpaccent!12, draw=agpaccent] (rew) at (0,-5.9) {\textbf{Reward} $r_t$ (exact geometry)\\coverage, guard and redundancy potentials,\\scaffolds, penalties, terminal bonus};
   \draw[flow] (state) -- node[above, font=\small]{render} (obs);
   \draw[flow] (obs) -- (pol);
   \draw[flow] (pol) -- node[above, font=\small]{$a_t$} (env);
@@ -872,16 +891,19 @@ the ratchet.
 Let $g$ be the placed (projected) point, $\iota = \Ind{q \notin \operatorname{int}\Free}$,
 $D$ the bounding-box diagonal and $j^\star$ the guard nearest $q$. The per-step reward is
 \[
-r_t \;=\;
+r_t \;=\; r^{\mu}_t \;+\; w_{\mathrm{prune}}\bigl(R(s_t) - R(s_{t+1})\bigr),
+\]
+\[
+r^{\mu}_t \;=\;
 \begin{cases}
   w_{\mathrm{cov}}\,\delta^+ - w_{\mathrm{par}} - w_{\mathrm{proj}}\,\iota + r^{\mathrm{scaf}}_t, & \mu=\ADD, \\[4pt]
-  -w_{\mathrm{cov}}\,\delta^-_{j^\star} + w_{\mathrm{par}}
-  + w_{\mathrm{prune}}\exp\!\bigl(-\delta^-_{j^\star}/\sigma_p\bigr), & \mu=\DEL\text{, accepted}, \\[4pt]
+  -w_{\mathrm{cov}}\,\delta^-_{j^\star} + w_{\mathrm{par}}, & \mu=\DEL\text{, accepted}, \\[4pt]
   -w_{\mathrm{void}}, & \mu=\DEL\text{, refused or no guards}, \\[4pt]
   -w_{\mathrm{stop}}\Ind{f(S_t) < c^\dagger}, & \mu=\STOP,
 \end{cases}
 \]
-plus, on termination only,
+where $R$ is the soft redundant-guard count of \cref{sec:shaping}, recomputed after every
+step whatever the mode, plus, on termination only,
 \[
   r^{\mathrm{term}} \;=\;
   \begin{cases}
@@ -912,7 +934,7 @@ coverage   & $w_{\mathrm{cov}}$   & area gained / lost (potential) & 1.0 & 1.0 \
            & $w_{\mathrm{goal}}$  & terminal bonus for $f\ge c^\dagger$ & 4.0 & 4.0 \\
            & $w_{\mathrm{fail}}$  & terminal penalty otherwise & 2.0 & 2.0 \\
 parsimony  & $w_{\mathrm{par}}$   & cost per guard, refunded on deletion (potential) & 0 & 0.15 \\
-           & $w_{\mathrm{prune}}$ & bonus for a deletion that loses no area & 0 & 0.20 \\
+           & $w_{\mathrm{prune}}$ & drop in the soft count of redundant guards $R$ (potential) & 0 & 0.20 \\
            & $w_{\mathrm{pars}}$  & terminal bonus per guard saved vs.\ $k_{\mathrm{ref}}$ & 0 & 0.50 \\
 scaffolds  & $w_{\mathrm{front}}$ & guard placed in uncovered space & 0.04 & 0 \\
            & $w_{\mathrm{sweep}}$ & boundary-first, then inward & 0.06 & 0 \\
@@ -925,7 +947,8 @@ regularity & $w_{\mathrm{proj}}$  & aimed outside $\Free$ & 0.25 & 0.25 \\
 \end{table}
 
 \paragraph{Why each group exists.}
-The coverage and parsimony potentials carry the objective (\cref{sec:shaping}). The terminal
+The coverage, guard-count and redundancy potentials carry the objective
+(\cref{sec:shaping}); the redundancy potential is what pays for deleting redundant guards. The terminal
 terms make crossing $c^\dagger$ the thing that matters, and $w_{\mathrm{pars}}$ rewards beating
 greedy, never punishing a match. The scaffolds make early coverage learning fast: aim at
 uncovered space, trace the boundary first, do not stack guards; being non-potential, they are
@@ -958,23 +981,28 @@ The weights are sized so that no shortcut beats solving the gallery.
   \item \textbf{Parsimony never makes failure attractive (stage 2).} A full budget costs
         $16\times0.15 = 2.4$, less than the $w_{\mathrm{goal}}+w_{\mathrm{fail}} = 6$ swing
         between solving and failing.
-  \item \textbf{Pruning is worth doing.} A free deletion returns
-        $w_{\mathrm{par}} + w_{\mathrm{prune}} = 0.35$, large relative to per-step noise, and
-        the bonus decays as $\exp(-\delta^-/0.005)$, by a factor $e$ for every half percent of
-        the gallery lost.
+  \item \textbf{Pruning is worth doing.} Deleting a fully redundant guard lowers $R$ by at
+        least $1$, so it returns at least $w_{\mathrm{par}} + w_{\mathrm{prune}} = 0.35$, large
+        relative to per-step noise. It returns more when the deletion also makes a partner
+        load-bearing: if two guards cover the same region, both count as redundant, and
+        removing one drops $R$ by $2$, for $0.15 + 0.20\times2 = 0.55$. A guard's contribution
+        to $R$ decays as $\exp(-\hat\delta^-/0.005)$, by a factor $e$ for every half percent of
+        the gallery it alone covers, so deleting a load-bearing guard earns almost nothing from
+        $R$ and pays the coverage loss in full.
   \item \textbf{Stopping early is costly.} $\STOP$ below $c^\dagger$ costs $w_{\mathrm{stop}} =
         2$ plus the $w_{\mathrm{fail}} = 2$ terminal penalty.
 \end{itemize}
 
-\paragraph{A known weakness: an add--delete cycle.}
-The prune bonus is not potential-based. In stage 2, adding a guard in already covered space
-earns $-w_{\mathrm{par}} = -0.15$, and immediately deleting it earns $w_{\mathrm{par}} +
-w_{\mathrm{prune}} = 0.35$: a net $+0.20$ per two steps, which over a 40-step episode can
-approach the goal bonus. The bonus is bounded per deletion but not per episode. Candidate
-fixes are to pay it only for guards that were present at the start of the episode or before
-the last $\ADD$, to cap it per episode, or to anneal it to zero late in stage 2 as
-\cref{rule:anneal} requires of non-potential terms. Stage-2 rollouts should be checked for
-this behaviour.
+\paragraph{Why the pruning reward is a potential.}
+The obvious alternative, a bonus $w_{\mathrm{prune}}\exp(-\delta^-/\sigma_p)$ paid on each
+deletion, can be farmed. Adding a guard in already covered space costs $w_{\mathrm{par}} =
+0.15$, and deleting it straight away pays $w_{\mathrm{par}} + w_{\mathrm{prune}} = 0.35$: a net
+$+0.20$ per two steps, which over a 40-step episode approaches the goal bonus. Paying the
+change of $R$ instead closes the loop exactly: adding a redundant guard raises $R$ by $1$
+and costs $w_{\mathrm{prune}}$, deleting it lowers $R$ by $1$ and pays $w_{\mathrm{prune}}$
+back, and the cycle nets zero. Over any episode the pruning reward totals
+$w_{\mathrm{prune}}(R(s_0)-R(s_T))$, which is bounded and is earned only by ending with fewer
+redundant guards than at the start.
 
 % ===========================================================================
 \section{Optional stage 3: relocation}\label{sec:stage3}
@@ -992,9 +1020,10 @@ What it would need:
   \item \textbf{A displacement head.} The spatial policy accommodates this naturally: a second
         pair of Beta maps per cell gives a bounded displacement for the guard selected in that
         cell, and the log-probability factorises as in \cref{sec:action}.
-  \item \textbf{Reward.} The coverage potential already values a move correctly as
-        $w_{\mathrm{cov}}(f(S') - f(S))$, and the guard count does not change, so no new
-        reward term is needed.
+  \item \textbf{Reward.} The potentials already value a move correctly: coverage pays
+        $w_{\mathrm{cov}}(f(S') - f(S))$, the redundancy potential pays
+        $w_{\mathrm{prune}}(R(s)-R(s'))$ when the move makes a neighbour redundant, and the
+        guard count does not change. No new reward term is needed.
   \item \textbf{Ratchet interaction.} A move that lowers coverage below
         $c^{\mathrm{best}}-0.01$ should be refused like a deletion, or the slack widened for
         moves, since a good relocation can pass through a temporary loss.
