@@ -14,6 +14,7 @@ Module map
     baselines.py  greedy cover and greedy prune -- the baselines to beat
     rewards.py    the reward basis and the per-stage weight schedule
     env.py        the Gymnasium environment (the MDP itself)
+    policy.py     spatial PPO policy: Add/Del/Stop, a map region, a continuous point in it
     viewer.py     matplotlib rendering of a gallery, its guards and their coverage
     callbacks.py  training-progress viewer + stage scheduler for Stable-Baselines3
     train.py      command-line entry point: generate / train / test
@@ -26,6 +27,7 @@ __all__ = [
     "baselines",
     "rewards",
     "env",
+    "policy",
     "viewer",
     "callbacks",
 ]

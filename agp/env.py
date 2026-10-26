@@ -32,12 +32,10 @@ from .rewards import RewardShape, RewardWeights, SATURATE
 # Action encoding
 # ---------------------------------------------------------------------------
 # The document specifies a factored action: a categorical head over
-# {Add, Del, Stop} and a Beta-distributed point in the unit square. Stable-
-# Baselines3's stock PPO does not support mixed action spaces, so we use the
-# standard flattening: a 3-vector in [0, 1]^3 where the first component selects
-# the mode by thresholding and the other two are the point. Behaviourally this
-# is the same action set; only the policy's output distribution differs
-# (a squashed Gaussian instead of categorical x Beta).
+# {Add, Del, Stop} and a point in the unit square. Stable-Baselines3 has no
+# mixed action space, so the action travels as one 3-vector [mode, x, y] with
+# the mode as an integer 0/1/2 in a float slot. policy.py supplies the matching
+# distribution: a real categorical for the mode, a Gaussian for the point.
 ADD, DEL, STOP = 0, 1, 2
 
 
@@ -100,9 +98,11 @@ class ArtGalleryEnv(gym.Env):
         self._rng = np.random.default_rng(seed)
 
         # --- spaces -------------------------------------------------------
-        # Action: [mode, x, y], all in [0, 1]. x and y are normalised
-        # coordinates within the gallery's bounding box.
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(3,), dtype=np.float32)
+        # Action: [mode, x, y]. mode is ADD/DEL/STOP as 0/1/2; x and y are in
+        # [0, 1], normalised coordinates within the gallery's bounding box.
+        self.action_space = spaces.Box(low=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+                                       high=np.array([2.0, 1.0, 1.0], dtype=np.float32),
+                                       dtype=np.float32)
 
         # Observation: an image the CNN reads, and scalars the MLP reads.
         size = self.config.img_size
@@ -303,20 +303,18 @@ class ArtGalleryEnv(gym.Env):
     # -----------------------------------------------------------------------
     def _decode(self, action):
         """Turn the raw 3-vector into (mode, x, y) in gallery coordinates."""
-        action = np.clip(np.asarray(action, dtype=np.float64), 0.0, 1.0)
+        action = np.asarray(action, dtype=np.float64)
+        px, py = np.clip(action[1:], 0.0, 1.0)
 
-        # Stage 1 masks Del and Stop: whatever the policy emits, it is an Add.
+        # Stage 1 masks Del and Stop. The policy masks them too; this keeps the
+        # environment correct for any policy, including one not trained here.
         if not self.config.allow_delete:
             mode = ADD
-        elif action[0] < 1.0 / 3.0:
-            mode = ADD
-        elif action[0] < 2.0 / 3.0:
-            mode = DEL
         else:
-            mode = STOP
+            mode = int(np.clip(np.rint(action[0]), ADD, STOP))
 
         minx, miny, maxx, maxy = self.gallery.bounds
-        return mode, minx + action[1] * (maxx - minx), miny + action[2] * (maxy - miny)
+        return mode, minx + px * (maxx - minx), miny + py * (maxy - miny)
 
     # -----------------------------------------------------------------------
     # Observation

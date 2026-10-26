@@ -23,6 +23,7 @@ from pathlib import Path
 
 import matplotlib
 import numpy as np
+import torch
 
 matplotlib.use("Agg")   # must precede any pyplot import; training is headless
 
@@ -33,6 +34,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMoni
 from . import dataset as dataset_module
 from .callbacks import EpisodeMetrics, TrainingViewer, WeightSchedule
 from .env import ArtGalleryEnv, EnvConfig
+from .policy import SpatialPolicy, SpatialTrunk, prime_mode_head
 from .rewards import PRUNE, RewardShape, SATURATE, prune_weights, saturate_weights
 
 
@@ -111,47 +113,65 @@ def cmd_train(args):
     )
     env = build_vec_env(train_records, stage1_config, SATURATE, args.n_envs, args.seed)
 
-    # --- the agent ---------------------------------------------------------
-    # MultiInputPolicy gives us SB3's CombinedExtractor: a CNN over the image
-    # channels and an MLP over the scalars, concatenated. The image is stored
-    # channels-last and SB3 transposes it automatically.
-    model = PPO(
-        "MultiInputPolicy",
-        env,
-        learning_rate=args.lr,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        n_epochs=10,
-        gamma=0.995,            # episodes are short; credit must reach the terminal bonus
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=args.ent_coef,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        tensorboard_log=str(run_dir),
-        seed=args.seed,
-        device=args.device,
-        verbose=1,
-    )
+    if args.from_stage1:
+        # Skip stage 1 and continue from a saved checkpoint. The step counter
+        # is restored with it, so stage 2's logs line up after stage 1's.
+        model = PPO.load(args.from_stage1, env=env, device=args.device,
+                         tensorboard_log=str(run_dir))
+        model.target_kl = args.target_kl or None
+        print(f"[train] loaded stage 1 from {args.from_stage1} "
+              f"({model.num_timesteps:,} steps)")
+    else:
+        # --- the agent -----------------------------------------------------
+        # SpatialPolicy keeps the image's layout through the network and
+        # places guards by choosing a region of the map, then a continuous
+        # point inside it; see policy.py. The image is stored channels-last;
+        # SB3 transposes it.
+        model = PPO(
+            SpatialPolicy,
+            env,
+            learning_rate=args.lr,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            n_epochs=10,
+            gamma=0.995,            # episodes are short; credit must reach the terminal bonus
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=args.ent_coef,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            # Optional early stop of an update's epochs past this KL. Off by
+            # default: a 0.03 cap starved the old Gaussian point head of
+            # updates and its deterministic policy never learned to aim.
+            target_kl=args.target_kl or None,
+            policy_kwargs=dict(features_extractor_class=SpatialTrunk,
+                               features_extractor_kwargs=dict(grid=args.grid)),
+            tensorboard_log=str(run_dir),
+            seed=args.seed,
+            device=args.device,
+            verbose=1,
+        )
+        # Stage 1 is Add-only: Del and Stop are masked at the logits.
+        model.policy.add_only = True
 
-    viewer_config = EnvConfig(**{**stage1_config.__dict__, "augment": False})
+        viewer_config = EnvConfig(**{**stage1_config.__dict__, "augment": False})
 
-    # =======================================================================
-    # Stage 1 -- SATURATE
-    # =======================================================================
-    print(f"\n[train] === stage 1: saturate ({args.stage1_steps:,} steps) ===")
-    model.learn(
-        total_timesteps=args.stage1_steps,
-        callback=[
-            WeightSchedule(saturate_weights, args.stage1_steps),
-            EpisodeMetrics(),
-            TrainingViewer(test_records, viewer_config, every=args.viewer_every),
-        ],
-        tb_log_name="stage1_saturate",
-        progress_bar=args.progress,
-    )
-    model.save(run_dir / "stage1_saturate")
-    print(f"[train] saved {run_dir / 'stage1_saturate.zip'}")
+        # ===================================================================
+        # Stage 1 -- SATURATE
+        # ===================================================================
+        print(f"\n[train] === stage 1: saturate ({args.stage1_steps:,} steps) ===")
+        model.learn(
+            total_timesteps=args.stage1_steps,
+            callback=[
+                WeightSchedule(saturate_weights, args.stage1_steps),
+                EpisodeMetrics(),
+                TrainingViewer(test_records, viewer_config, every=args.viewer_every),
+            ],
+            tb_log_name="stage1_saturate",
+            progress_bar=args.progress,
+        )
+        model.save(run_dir / "stage1_saturate")
+        print(f"[train] saved {run_dir / 'stage1_saturate.zip'}")
 
     # =======================================================================
     # Stage 2 -- PRUNE
@@ -166,6 +186,10 @@ def cmd_train(args):
     })
     env.set_attr("config", stage2_config)
     env.set_attr("weights", PRUNE)
+
+    # Unmask Del and Stop. Their logits were never trained in stage 1, so
+    # start the mode head at "mostly Add" rather than wherever it was left.
+    prime_mode_head(model.policy, add_prob=args.add_prob)
 
     # Two thirds of the action space has never been exercised, so temporarily
     # raise the entropy bonus to stop the policy collapsing onto Add out of habit.
@@ -287,7 +311,8 @@ def build_parser():
     parser.add_argument("--max-guards", type=int, default=16)
     parser.add_argument("--max-steps", type=int, default=40)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", default="auto",
+                        help="torch device; 'auto' prefers CUDA, then Apple MPS, then CPU")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -310,6 +335,14 @@ def build_parser():
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--ent-coef", type=float, default=0.005)
+    p.add_argument("--grid", type=int, default=16,
+                   help="cells per side of the placement grid (positions stay continuous)")
+    p.add_argument("--target-kl", type=float, default=0.0,
+                   help="stop an update's epochs early past this KL (0 disables)")
+    p.add_argument("--from-stage1", default=None,
+                   help="skip stage 1 and start stage 2 from this checkpoint")
+    p.add_argument("--add-prob", type=float, default=0.8,
+                   help="stage-2 start: probability of Add; Del and Stop share the rest")
     p.add_argument("--presaturate", type=float, default=0.4,
                    help="fraction of stage-2 episodes starting from the greedy cover")
     p.add_argument("--viewer-every", type=int, default=20_000,
@@ -333,6 +366,10 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    # SB3's own 'auto' never picks Apple's GPU, which runs the spatial policy
+    # tens of times faster than the CPU here.
+    if args.device == "auto" and not torch.cuda.is_available() and torch.backends.mps.is_available():
+        args.device = "mps"
     args.func(args)
 
 

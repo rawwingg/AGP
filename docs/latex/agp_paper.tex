@@ -1,0 +1,1013 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{agpstyle}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usepgfplotslibrary{fillbetween}
+\usetikzlibrary{patterns,shapes.geometric}
+
+\title{\bfseries Reinforcement Learning for the Continuous Art Gallery Problem\\[4pt]
+\large Preliminaries, Policy Architecture, and MDP Formulation}
+\author{AGP Project --- Technical Report}
+\date{\today}
+
+% A visible marker for numbers that do not exist yet.
+\newcommand{\pending}[1]{\textcolor{agpaccent}{\textbf{[pending#1]}}}
+
+% One colour scheme for every figure.
+\colorlet{seen}{agpblue!22}
+\colorlet{unseen}{agpaccent!35}
+\colorlet{wall}{black!80}
+\colorlet{masked}{black!18}
+\tikzset{
+  hole/.style={fill=white, draw=agpaccent, line width=0.9pt},
+  outer/.style={draw=wall, line width=1.1pt},
+  guard/.style={circle, fill=black, inner sep=1.6pt},
+  ray/.style={dashed, black!55, line width=0.5pt},
+  blk/.style={draw=agpblue, fill=agpgrey, rounded corners=2pt, align=center, font=\small, inner sep=4pt},
+  flow/.style={-Stealth, thick, agpblue},
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+We train a PPO agent to place point guards in polygonal galleries with holes so that at
+least $98\%$ of the free space is seen, using as few guards as possible. This report
+explains every design decision in the current implementation. \Cref{sec:prelim} gives the
+geometry that motivates a two-stage curriculum: coverage is monotone submodular, so a
+guard's redundancy can only be measured \emph{after} the gallery is saturated, and the
+dense rewards we use are potential-based, so they telescope into the true objective.
+\Cref{sec:arch} describes the policy network and why each part of it exists: it keeps the
+map's spatial layout to the output and factors each placement into a choice of region and a
+\emph{continuous} point inside it. \Cref{sec:mdp} states the MDP and the reward with the exact
+constants used in code. \Cref{sec:stage3} outlines an optional third stage with a relocation
+action.
+\end{abstract}
+
+\tableofcontents
+
+% ===========================================================================
+\section{Introduction}
+% ===========================================================================
+
+The agent sees an image of a gallery and the guards placed so far. At each step it either
+adds a guard at a point, deletes the guard nearest to a point, or stops. Training runs in
+two stages on one network (\cref{fig:curriculum}):
+
+\begin{description}[leftmargin=1.6em]
+  \item[\stageI{} (stage 1).] Only $\ADD$ is allowed and guards are free. The agent learns
+        to cover arbitrary galleries.
+  \item[\stageII{} (stage 2).] $\DEL$ and $\STOP$ are unmasked, every guard costs reward,
+        and deleting a guard that costs no coverage is paid. The agent learns to remove the
+        guards it does not need.
+\end{description}
+
+Three facts shape everything below. The problem is NP-hard, so a learned heuristic is a
+reasonable target (\cref{sec:complexity}). Coverage is submodular, which fixes the
+\emph{order} of the two stages (\cref{sec:submod}). And guards see without a range limit,
+so whether a point is a good guard position depends on the whole gallery, which shapes the
+network (\cref{sec:arch}). The implementation lives in \code{agp/}: geometry in
+\code{gallery.py}, the MDP in \code{env.py}, rewards in \code{rewards.py}, the policy in
+\code{policy.py}, and the curriculum in \code{train.py}. All constants quoted below are the
+values in that code.
+
+% ===========================================================================
+\section{Preliminaries: why two stages}\label{sec:prelim}
+% ===========================================================================
+
+\subsection{Galleries, visibility, coverage}
+
+\begin{definition}[Gallery and free space]
+A gallery $\Gallery = (\Poly, \Holes)$ is a simple polygon $\Poly \subset \Real^2$ with a
+finite set $\Holes$ of pairwise disjoint polygonal holes inside it. The free space is
+$\Free = \Poly \setminus \bigcup_{H \in \Holes} \operatorname{int} H$, with area
+$A = \Area{\Free} > 0$.
+\end{definition}
+
+\begin{definition}[Visibility polygon]
+A guard at $g \in \Free$ sees $\Vis(g) = \{ q \in \Free : \overline{gq} \subseteq \Free \}$.
+\end{definition}
+
+Visibility has \emph{unlimited range}: a guard sees every point it has an unobstructed
+segment to, however far, and only the outer wall and the holes block it
+(\cref{fig:visibility}). \code{Gallery.visibility\_polygon} computes $\Vis(g)$ exactly. It
+casts one ray towards every vertex of $\Poly$ and of every hole, plus one ray
+$\pm 10^{-6}$\,rad to either side, so that both edges meeting at an occluding (reflex) corner
+are captured. Each ray is $3\times$ the bounding-box diagonal long, so effectively infinite,
+and is cut at its first boundary hit. The hits, taken in angular order, form $\Vis(g)$,
+which is clipped back to $\Free$.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[scale=0.95]
+  % free space, all visible to start with
+  \fill[seen] (0,0) -- (8,0) -- (8,5) -- (2,5) -- (2,3.6) -- (0,3.6) -- cycle;
+  % shadow cast by the hole (rays through its two silhouette corners)
+  \fill[unseen] (4,3) -- (8,3.8) -- (8,1.2) -- (4,2) -- cycle;
+  % wedge hidden behind the reflex corner of the outer wall
+  \fill[unseen] (2,3.6) -- (2,5) -- (2.636,5) -- cycle;
+  \draw[ray] (1.5,2.5) -- (8,3.8);
+  \draw[ray] (1.5,2.5) -- (8,1.2);
+  \draw[ray] (1.5,2.5) -- (2.636,5);
+  \draw[outer] (0,0) -- (8,0) -- (8,5) -- (2,5) -- (2,3.6) -- (0,3.6) -- cycle;
+  \draw[hole] (4,2) rectangle (5,3);
+  \node[guard, label={[font=\small]below:$g$}] at (1.5,2.5) {};
+  \node[font=\small] at (4.5,2.5) {hole};
+  \node[font=\small, align=center] at (6.7,2.5) {shadow\\of the hole};
+  \node[font=\small, anchor=west, align=left] (rc) at (8.4,4.6) {hidden behind\\a reflex corner};
+  \draw[-Stealth, black!60] (rc.west) -- (2.35,4.8);
+  \node[font=\small, anchor=west] (vs) at (8.4,0.6) {$\Vis(g)$};
+  \draw[-Stealth, black!60] (vs.west) -- (6.5,0.5);
+\end{tikzpicture}
+\caption{\textbf{Visibility has unlimited range and is blocked only by walls and holes.} The
+guard $g$ sees the whole blue region, up to the far wall. It cannot see the orange regions:
+the shadow cast by the hole, bounded by the rays through the hole's two silhouette corners,
+and a thin wedge behind the reflex corner of the outer wall. Thin wedges like this are what
+the last few guards of a solution exist to cover.}
+\label{fig:visibility}
+\end{figure}
+
+\begin{definition}[Coverage]
+For a finite guard set $S \subset \Free$ let $\Cov(S) = \bigcup_{g\in S}\Vis(g)$ and
+$f(S) = \Area{\Cov(S)}/A \in [0,1]$. A gallery is \emph{solved} when $f(S) \ge c^\dagger$
+with $c^\dagger = 0.98$.
+\end{definition}
+
+The threshold $c^\dagger < 1$ is deliberate. Full coverage can require a guard for a
+sliver of a few square units behind a hole, and that last guard dominates the count
+without telling us anything about placement quality. At $98\%$ the greedy baseline solves
+$598/600$ training and $88/90$ test galleries under the 16-guard budget; the rest stop
+between $97.7\%$ and $98\%$ because no candidate point adds new area
+(\cref{sec:greedy}).
+
+\paragraph{Two representations of the same geometry.}
+Every quantity that enters the \emph{reward} is computed exactly with Shapely polygons:
+$f(S)$, the area a new guard adds, and the area lost when a guard is removed. The
+\emph{observation} is a $64\times 64$ raster of the gallery's bounding box: pixel $(r,c)$
+samples the point $(x_{\min} + c\,w/63,\; y_{\min} + r\,h/63)$, where $w, h$ are the box's
+width and height. The raster is also used for one cheap estimate shown to the agent, the
+per-guard exclusive area (\cref{sec:obs}). Exact rewards mean the agent is never paid for
+raster artefacts; a raster observation means the network can be convolutional.
+
+\subsection{Complexity, and what a learned policy can gain}\label{sec:complexity}
+
+Chv\'atal's theorem gives $\lfloor n/3\rfloor$ vertex guards as the tight worst case for a
+simple $n$-gon \cite{chvatal1975,fisk1978}. Finding a \emph{minimum} guard set is NP-hard
+\cite{leelin1986}, hard to approximate \cite{eidenbenz2001}, and with guards allowed
+anywhere in the polygon the decision problem is $\exists\Real$-complete
+\cite{abrahamsen2018}. Exact and near-exact solvers exist but restrict guards to finite
+candidate sets such as vertices or grid points \cite{couto2011,tozoni2016}.
+
+This tells us where a learned policy can do better than classical heuristics:
+\begin{enumerate}
+  \item \textbf{Continuous positions.} Optimal point guards need not lie on any candidate
+        set. A policy that outputs real coordinates can reach positions no candidate-based
+        method can. We keep the action continuous for this reason (\cref{sec:action}).
+  \item \textbf{Pruning.} Greedy covers are not minimal, so removing redundant guards
+        recovers slack that greedy leaves behind (\cref{sec:greedy}).
+\end{enumerate}
+
+\subsection{Submodularity: why pruning must come second}\label{sec:submod}
+
+\begin{proposition}[Monotone submodularity]\label{prop:submod}
+$f(\emptyset)=0$, $f$ is monotone, and for all $S \subseteq S'$ and every $g$,
+\[
+  f(S\cup\{g\}) - f(S) \;\ge\; f(S'\cup\{g\}) - f(S').
+\]
+\end{proposition}
+
+\begin{proof}
+With $\nu = \Area{\cdot}/A$, the marginal gain is $\nu(\Vis(g)\setminus\Cov(S))$. Since
+$\Cov(S)\subseteq\Cov(S')$, the set being measured can only shrink as $S$ grows.
+\end{proof}
+
+Two quantities drive the design. For a candidate $g \notin S$ and a placed guard $g_j\in S$,
+\[
+  \delta^{+}(g\mid S) = f(S\cup\{g\}) - f(S),
+  \qquad
+  \delta^{-}(g_j\mid S) = f(S) - f(S\setminus\{g_j\}).
+\]
+$\delta^+$ is the \emph{marginal gain} of adding, and $\delta^-$ is the \emph{exclusive area}
+of a placed guard, i.e.\ what deleting it would cost. A guard with $\delta^-=0$ is strictly
+redundant.
+
+\begin{proposition}[Redundancy is revealed only after saturation]\label{prop:redundancy}
+Insert guards $g_1,\dots,g_K$ in order and let $S_j=\{g_1,\dots,g_j\}$. Then for every $j$,
+\[
+  \delta^-(g_j\mid S_K) \;\le\; \delta^+(g_j\mid S_{j-1}),
+\]
+and $\delta^-(g_j\mid S)$ is non-increasing in $S \ni g_j$.
+\end{proposition}
+
+\begin{proof}
+Apply \cref{prop:submod} to $S_{j-1}\subseteq S_K\setminus\{g_j\}$.
+\end{proof}
+
+\Cref{fig:submod} shows both propositions on a real test gallery. The coverage curve flattens
+as guards are added, and the second guard, which added $28\%$ of the gallery when it was
+placed, ends up with an exclusive area of zero.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  name=cov, width=0.47\linewidth, height=5.2cm,
+  xlabel={guards placed by greedy}, ylabel={coverage $f(S_j)$},
+  xmin=0, xmax=7.3, ymin=0, ymax=1.05, xtick={0,...,7},
+  ytick={0,0.2,0.4,0.6,0.8,0.98}, yticklabels={0,0.2,0.4,0.6,0.8,$c^\dagger$},
+  grid=major, grid style={black!10}, tick label style={font=\small}, label style={font=\small}]
+  \addplot[agpblue, thick, mark=*, mark size=1.6pt] coordinates
+    {(0,0) (1,0.4259) (2,0.7073) (3,0.8024) (4,0.8858) (5,0.9468) (6,0.9783) (7,0.9859)};
+  \addplot[agpaccent, dashed, thick, domain=0:7.3] {0.98};
+\end{axis}
+\begin{axis}[
+  at={(cov.east)}, anchor=west, xshift=1.6cm,
+  width=0.47\linewidth, height=5.2cm, ybar, bar width=5pt,
+  xlabel={guard $j$ (insertion order)}, ylabel={fraction of gallery},
+  xmin=0.4, xmax=7.6, ymin=0, ymax=0.47, xtick={1,...,7},
+  legend style={font=\small, draw=none, fill=none, at={(0.98,0.97)}, anchor=north east},
+  tick label style={font=\small}, label style={font=\small}]
+  \addplot[fill=agpblue!70, draw=agpblue] coordinates
+    {(1,0.4259) (2,0.2814) (3,0.0950) (4,0.0835) (5,0.0610) (6,0.0315) (7,0.0076)};
+  \addplot[fill=agpaccent!70, draw=agpaccent] coordinates
+    {(1,0.1453) (2,0.0000) (3,0.0858) (4,0.0546) (5,0.0491) (6,0.0119) (7,0.0076)};
+  \legend{$\delta^+$ when placed, $\delta^-$ at the end}
+  \node[font=\small, align=center, anchor=south] at (axis cs:2.35,0.29) {redundant\\at the end};
+\end{axis}
+\end{tikzpicture}
+\caption{\textbf{Greedy saturates with diminishing returns and leaves redundant guards behind.}
+Real data: greedy cover of hard test gallery \#63. \emph{Left:} each extra guard adds less
+(\cref{prop:submod}); the seventh adds $0.8\%$ to cross $c^\dagger$. \emph{Right:} for every
+guard, the exclusive area at the end ($\delta^-$) is at most its gain when placed
+($\delta^+$), as \cref{prop:redundancy} requires. Guard 2 covered $28\%$ when placed and is
+fully redundant at the end, so the greedy prune removes it ($k_{\mathrm{greedy}}=7$,
+$k_{\mathrm{ref}}=6$). Its redundancy only became visible after guards 3--7 were placed.}
+\label{fig:submod}
+\end{figure}
+
+\takeaway{%
+\textbf{Consequence.} A guard can only become \emph{cheaper} to delete as more guards are
+added. A deletion decision made early in an episode sees an exclusive area that is too large;
+after saturation it sees the smallest value that guard will ever have. Learning to cover
+first and to prune second is therefore the order in which the pruning signal is most
+informative, not just a convenience.}
+
+\subsection{Greedy, its guarantees, and the reference count}\label{sec:greedy}
+
+The greedy rule ``add the guard of largest $\delta^+$'' inherits the $(1-1/e)$ guarantee for
+budgeted monotone submodular maximisation \cite{nemhauser1978} and the logarithmic-factor
+guarantee for full cover, which is essentially the best possible for set cover in polynomial
+time \cite{feige1998}. Greedy is therefore strong at \emph{covering}. It is weak at
+\emph{minimality}: by \cref{prop:redundancy}, guards chosen early lose exclusive area as
+later guards overlap them, and greedy never revisits a choice.
+
+Our baseline (\code{baselines.py}) makes this concrete for each gallery:
+\begin{enumerate}
+  \item \textbf{Candidates.} One point per vertex of $\Poly$ and of every hole, moved $1\%$
+        of the diagonal towards an interior reference point, plus $40$ uniform interior
+        samples.
+  \item \textbf{Greedy cover.} Repeatedly add the candidate with the largest raster marginal
+        gain until $f\ge c^\dagger$, the budget of $16$ is reached, or no candidate adds
+        area. The count is $k_{\mathrm{greedy}}$.
+  \item \textbf{Greedy prune.} Repeatedly delete the guard with the smallest exact
+        $\delta^-$ while coverage stays $\ge c^\dagger$. The remaining count is
+        $k_{\mathrm{ref}}$.
+\end{enumerate}
+
+$k_{\mathrm{ref}}$ is the per-instance reference that the parsimony reward and the reported
+\emph{guard ratio} $k/k_{\mathrm{ref}}$ are measured against. It is an \emph{upper bound} on
+the optimum, not the optimum: it depends on the candidate set, and the true minimum is
+NP-hard to compute. A guard ratio below $1$ means beating greedy, not proving optimality.
+On the training set, $k_{\mathrm{greedy}}$ ranges over $1$--$3$ (easy), $2$--$5$ (mid) and
+$3$--$11$ (hard). Mean test-set values are in \cref{tab:greedy}.
+
+\begin{table}[t]
+\centering\small
+\caption{Greedy baseline on the 90 test galleries (30 per tier).}
+\label{tab:greedy}
+\begin{tabular}{lccc}
+\toprule
+tier & mean $k_{\mathrm{greedy}}$ & mean $k_{\mathrm{ref}}$ (after prune) & mean coverage \\
+\midrule
+easy & 1.93 & 1.93 & 0.994 \\
+mid  & 2.70 & 2.67 & 0.992 \\
+hard & 6.07 & 5.97 & 0.986 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Why one stage collapses}\label{sec:collapse}
+
+The objective is to solve the gallery with few guards. With a guard cost $w_{\mathrm{par}}$
+per guard and a coverage weight $w_{\mathrm{cov}}$, the immediate value of one more $\ADD$ is
+$w_{\mathrm{cov}}\,\delta^+ - w_{\mathrm{par}}$, which is negative whenever
+\[
+  \delta^+ \;<\; w_{\mathrm{par}}/w_{\mathrm{cov}} \;=\; 0.15 \quad\text{(our stage-2 weights).}
+\]
+In \cref{fig:submod}, guards 3--7 all add less than $15\%$. Their only justification is the
+terminal bonus for crossing $c^\dagger$, and a policy that cannot yet cross $c^\dagger$
+reliably never collects it. From such a policy's point of view the late guards are pure
+cost, so it learns to place fewer of them, which makes crossing $c^\dagger$ rarer still. The
+fixed point of this feedback is ``place few guards and fail''.
+
+Stage 1 breaks the loop by setting $w_{\mathrm{par}}=0$: every $\ADD$ has non-negative value,
+the goal bonus is reachable, and the agent learns to cover. Stage 2 turns the cost on only
+after covering is reliable (\cref{fig:curriculum}). This matches the reference locomotion
+work, where a single-stage dribbling policy reaches $33\%$ success against $86.7\%$ with two
+stages \cite{wang2025dribble}.
+
+\subsection{Potential-based shaping: dense reward without bias}\label{sec:shaping}
+
+PPO needs a dense signal, but dense rewards can change which policy is optimal. We avoid
+this by making the two dense terms potentials. Let $u(s) = 1 - f(S)$ and $k(s)=\lvert S\rvert$
+and define
+\[
+  \Pot(s) \;=\; -w_{\mathrm{cov}}\,u(s) \;-\; w_{\mathrm{par}}\,k(s),
+  \qquad
+  F(s,s') = \gamma\Pot(s') - \Pot(s).
+\]
+At $\gamma=1$, $F$ is exactly the per-step reward we pay: $+w_{\mathrm{cov}}\delta^+ -
+w_{\mathrm{par}}$ on $\ADD$ and $-w_{\mathrm{cov}}\delta^- + w_{\mathrm{par}}$ on $\DEL$. Along
+any episode from the empty gallery ($u_0=1$, $k_0=0$),
+\[
+  \sum_{t=0}^{T-1} F(s_t,s_{t+1}) \;=\; \Pot(s_T) - \Pot(s_0)
+  \;=\; w_{\mathrm{cov}}\,c_T - w_{\mathrm{par}}\,k_T ,
+\]
+which is the objective itself. By the shaping theorem of \citet{ng1999}, adding $F$ does
+not change the optimal policy. We train with $\gamma=0.995$, for which the sum is
+$\gamma^T\Pot(s_T)-\Pot(s_0)$; the extra factor $\gamma^T$ mildly favours short episodes,
+i.e.\ fewer guards and a prompt $\STOP$, which is the direction we want anyway.
+
+\begin{designrule}[Anneal iff non-potential]\label{rule:anneal}
+A reward term may keep a fixed weight for the whole of training only if it is a potential
+difference or part of the objective. Any other term biases the optimum and must reach zero
+before training ends.
+\end{designrule}
+
+\Cref{rule:anneal} decides the schedule in \cref{fig:curriculum}: the coverage and
+guard-count terms stay on, and the stage-1 scaffolds (frontier, sweep, separation) are
+annealed to zero.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=\linewidth, height=6.2cm,
+  xmin=0, xmax=2.5, ymin=0, ymax=0.25,
+  xlabel={training steps ($\times 10^6$)}, ylabel={reward weight},
+  xtick={0,0.5,0.7,1,1.05,1.5,2}, xticklabels={0,0.5,0.7,1,,1.5,2},
+  ytick={0,0.04,0.06,0.10,0.15,0.20},
+  tick label style={font=\small}, label style={font=\small},
+  legend style={font=\small, draw=none, fill=white, fill opacity=0.85, text opacity=1,
+                at={(0.5,1.02)}, anchor=south, legend columns=5},
+  every axis plot/.append style={thick}]
+  % stage backgrounds
+  \fill[agpblue!6]   (axis cs:0,0)   rectangle (axis cs:1,0.25);
+  \fill[agpgreen!8]  (axis cs:1,0)   rectangle (axis cs:2,0.25);
+  \fill[pattern=north east lines, pattern color=black!12] (axis cs:2,0) rectangle (axis cs:2.5,0.25);
+  \addplot[agpblue]                 coordinates {(0,0.10) (0.7,0.10) (1,0) (2,0)};
+  \addplot[agpblue, dashed]         coordinates {(0,0.06) (0.7,0.06) (1,0) (2,0)};
+  \addplot[agpblue, dotted]         coordinates {(0,0.04) (0.7,0.04) (1,0) (2,0)};
+  \addplot[agpaccent]               coordinates {(0,0) (1,0) (1.05,0.15) (2,0.15)};
+  \addplot[agpaccent, dashed]       coordinates {(0,0) (1,0) (1.05,0.20) (2,0.20)};
+  \legend{$w_{\mathrm{sep}}$, $w_{\mathrm{sweep}}$, $w_{\mathrm{front}}$, $w_{\mathrm{par}}$, $w_{\mathrm{prune}}$}
+  \node[font=\small, align=center] at (axis cs:0.35,0.215) {\textbf{Stage 1: \stageI{}}\\only $\ADD$; guards free};
+  \node[font=\small, align=center] at (axis cs:1.5,0.215) {\textbf{Stage 2: \stageII{}}\\$\ADD$, $\DEL$, $\STOP$; guards cost};
+  \node[font=\small, align=center] at (axis cs:2.25,0.215) {\textbf{Stage 3}\\(optional)\\$+\MOVE$};
+  \node[font=\footnotesize, align=center] at (axis cs:0.85,0.135) {scaffolds\\annealed};
+  \node[font=\footnotesize, align=left, anchor=west] at (axis cs:1.08,0.045) {5\% blend; 40\% of episodes start\\from greedy cover $+\,4$ spares};
+\end{axis}
+\end{tikzpicture}
+\caption{\textbf{The curriculum and its reward-weight schedule}, with the exact values from
+\code{rewards.py}. In stage 1 the scaffolds (blue) hold their weight to $70\%$ of the stage
+and then fall linearly to $0$, so the last $30\%$ trains on the unbiased reward
+(\cref{rule:anneal}). Stage 2 blends from that column to the parsimony weights (orange) over
+its first $5\%$, which spares the value function a step change. Not plotted because of scale:
+the potential term $w_{\mathrm{cov}}=1$ and the terminal $w_{\mathrm{goal}}=4$,
+$w_{\mathrm{fail}}=2$ are constant; $w_{\mathrm{pars}}$ ($0\to0.5$), $w_{\mathrm{stop}}$
+($0\to2$) and $w_{\mathrm{void}}$ ($0\to0.1$) blend in with $w_{\mathrm{par}}$.}
+\label{fig:curriculum}
+\end{figure}
+
+% ===========================================================================
+\section{Architecture}\label{sec:arch}
+% ===========================================================================
+
+\subsection{What the policy has to do}
+
+At every step the policy outputs a mode in $\{\ADD,\DEL,\STOP\}$ and a point $(x,y)$ in the
+gallery's bounding box, normalised to $[0,1]^2$. The geometry of \cref{sec:prelim} turns this
+into five concrete requirements, and each part of the network answers one of them:
+
+\begin{description}[leftmargin=1.8em]
+  \item[R1 Continuous placement.] Point guards are continuous (\cref{sec:complexity}), so
+        the action must reach any point, not a fixed candidate set.
+  \item[R2 Several targets at once.] A partly covered hard gallery usually has several
+        separate uncovered pockets. The distribution over points must be able to put mass
+        on all of them, rather than on their average.
+  \item[R3 Global context.] With unlimited range, whether a point is useful depends on what
+        it can see across the whole gallery, not on its neighbourhood.
+  \item[R4 Fine localisation.] The missing $2$--$4\%$ of a nearly solved gallery is often a
+        thin wedge behind a hole or a reflex corner (\cref{fig:visibility}), a few pixels
+        wide. The network must not blur it away before deciding where to aim.
+  \item[R5 Unordered modes with masking.] $\ADD$, $\DEL$ and $\STOP$ are unordered
+        alternatives, and stage 1 must disable two of them cleanly.
+\end{description}
+
+\subsection{The network}
+
+\Cref{fig:net} shows the network (\code{policy.SpatialPolicy}, about $294$k parameters). Its
+organising idea is to \emph{read the placement off a map} rather than compute coordinates
+from a summary vector: one branch keeps the image's layout down to a $16\times16$ grid of
+cells, and a second branch summarises the whole gallery into one vector that is handed to
+every cell. The mode and the value of the state, which are properties of the whole gallery,
+are read from the summary.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[node distance=0.55cm]
+  \node[blk, text width=4.6cm] (in) {\textbf{Input} $64{\times}64{\times}7$\\5 image channels + $x$, $y$ coordinates};
+  \node[blk, text width=4.6cm, below=of in] (l1) {conv $5{\times}5$, stride 2 $\;\to 32{\times}32{\times}32$};
+  \node[blk, text width=4.6cm, below=of l1] (l2) {conv $3{\times}3$, stride 2 $\;\to 16{\times}16{\times}32$};
+  \node[blk, text width=4.6cm, below=of l2] (l3) {conv $3{\times}3$ $\;\to$ \textbf{cell features} $16{\times}16{\times}32$};
+  \node[blk, text width=4.6cm, below=1.3cm of l3] (cat) {concat $\;\to 16{\times}16{\times}64$};
+  \node[blk, text width=4.6cm, below=of cat] (c1) {\textbf{Cell head}: conv $3{\times}3$, conv $3{\times}3$ $\to 16{\times}16{\times}32$\\conv $1{\times}1$ $\;\to 16{\times}16{\times}5$};
+  \node[blk, text width=4.6cm, below=of c1, fill=agpaccent!12, draw=agpaccent] (out) {per cell $k$: score $s_k$ and\\Beta parameters $a^x_k, b^x_k, a^y_k, b^y_k$};
+
+  \node[blk, text width=4.4cm, right=1.6cm of l3] (g1) {conv $3{\times}3$/2 $\to 8{\times}8$;\; conv $3{\times}3$/2 $\to 4{\times}4{\times}32$};
+  \node[blk, text width=4.4cm, below=of g1] (g2) {flatten 512 $\to$ FC 256;\\concat 5 stats $\to$ FC 256};
+  \node[blk, text width=4.4cm, below=of g2, fill=agpblue!15] (z) {\textbf{global summary} $z\in\Real^{256}$};
+  \node[blk, text width=4.4cm, below=of z] (bc) {broadcast: FC $\to 32$, copied to all $16{\times}16$ cells};
+  \node[blk, text width=4.4cm, below=1.1cm of bc, fill=agpaccent!12, draw=agpaccent] (mode) {\textbf{Mode head} FC $\to 3$ logits\\$\ADD$ / $\DEL$ / $\STOP$};
+  \node[blk, text width=4.4cm, below=of mode, fill=agpaccent!12, draw=agpaccent] (val) {\textbf{Value head} FC 64, tanh, FC $\to V(s)$};
+
+  \node[blk, text width=3.2cm, left=1.0cm of l3, fill=white] (mask) {interior mask:\\max-pool channel 0\\$\to 16{\times}16$};
+
+  \draw[flow] (in) -- (l1); \draw[flow] (l1) -- (l2); \draw[flow] (l2) -- (l3);
+  \draw[flow] (l3) -- (cat); \draw[flow] (cat) -- (c1); \draw[flow] (c1) -- (out);
+  \draw[flow] (l3) -- (g1); \draw[flow] (g1) -- (g2); \draw[flow] (g2) -- (z);
+  \draw[flow] (z) -- (bc); \draw[flow] (bc) |- (cat);
+  \draw[flow] (z.east) -- ++(0.4,0) |- (mode.east);
+  \draw[flow] (z.east) -- ++(0.4,0) |- (val.east);
+  \draw[flow] (in.west) -| (mask.north);
+  \draw[flow] (mask.south) |- (out.west);
+  \node[font=\small\bfseries, text=agpblue, above=0.05cm of in] {local branch (keeps the layout)};
+  \node[font=\small\bfseries, text=agpblue, above=0.05cm of g1] {global branch (whole gallery)};
+\end{tikzpicture}
+\caption{\textbf{The spatial policy, with tensor sizes.} Left: the local branch never
+flattens the image, so placement is scored per cell on a $16\times16$ map. Right: the global
+branch summarises the whole gallery and the scalar stats into $z$, which is broadcast back to
+every cell (unlimited-range visibility depends on the whole gallery) and also feeds the mode
+and value heads. The interior mask removes cells with no free space from the cell
+distribution. ReLU after every convolution; ``/2'' is stride 2.}
+\label{fig:net}
+\end{figure}
+
+\paragraph{A $16\times16$ map, never flattened (R4).}
+The local branch downsamples the $64\times64$ image only to the cell grid ($G=16$, each cell
+$4\times4$ pixels) and keeps it there. Every cell has its own feature vector, computed from
+its own neighbourhood, so a thin uncovered wedge stays a feature of the cells it touches and
+can raise their scores directly. Aiming at a corner is then no harder than aiming at open
+floor: it is a different cell of the same map. Flattening the image into one vector before
+choosing a position would force the network to convert ``there is a sliver at the top left''
+into numeric coordinates, which is exactly the kind of fine spatial detail a coarse summary
+loses.
+
+\paragraph{Coordinate channels.}
+Convolutions are translation-invariant, but visibility is not: a point next to a wall sees
+differently from the same local pattern in the middle of the room. Two extra input channels
+hold each pixel's normalised $x$ and $y$ \cite{liu2018coordconv}, so every cell knows where it
+is in the gallery.
+
+\paragraph{A global summary broadcast to every cell (R3).}
+Local features alone cannot tell whether a point would see an uncovered region on the far
+side of the gallery. The global branch continues to $4\times4$, flattens, and merges the
+result with the five scalar stats into $z\in\Real^{256}$. A linear map of $z$ to $32$
+numbers is copied to every cell and concatenated with that cell's local features, so each
+cell is scored from both its neighbourhood and the state of the whole gallery: what is
+covered, where the guards are, how much budget is left.
+
+\paragraph{Masking cells outside the gallery.}
+A cell is \emph{live} if any of its $4\times4$ raster samples lies in the free space (a max-pool
+of the interior channel). Dead cells, outside $\Poly$ or entirely inside a hole, get logit
+$-10^{8}$ and zero probability (\cref{fig:action}). This removes a large and useless part of
+the search space (in the gallery of \cref{fig:action}, $68$ of the $256$ cells), and the
+policy never wastes probability on positions that would only be projected back into the
+gallery and penalised.
+
+\paragraph{Heads and initialisation.}
+The cell head outputs five maps: a score $s_k$ per cell and four Beta parameters, made
+$\ge 1$ by $1+\operatorname{softplus}(\cdot)$ so that every offset density is unimodal and
+bounded. The mode and value heads read $z$, because ``stop now'' and ``how good is this
+state'' are global questions. The last layers of the cell and mode heads are initialised
+orthogonally with gain $0.01$, so training starts from near-uniform cells, near-uniform modes
+and gently centred offsets.
+
+\subsection{The factored action}\label{sec:action}
+
+Index cells by $k = rG + c$ with row $r$ along $y$ and column $c$ along $x$. The policy
+samples
+\[
+  \mu \sim \mathrm{Cat}(\pi^{\mathrm{mode}}), \qquad
+  k \sim \mathrm{Cat}(\pi^{\mathrm{cell}}), \qquad
+  o_x \sim \mathrm{Beta}(a^x_k,b^x_k), \quad o_y \sim \mathrm{Beta}(a^y_k,b^y_k),
+\]
+\[
+  (x,y) \;=\; \Bigl(\frac{c + o_x}{G},\; \frac{r + o_y}{G}\Bigr),
+  \qquad
+  \pi^{\mathrm{cell}}_k \propto \exp(s_k)\,\Ind{\text{cell $k$ is live}},
+\]
+and sends the vector $[\mu, x, y]$ to the environment (\cref{fig:action}).
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[x=0.5cm, y=0.5cm]
+  % dead cells
+  \foreach \c/\r in {0/0,1/0,2/0,3/0,4/0,5/0,6/0,7/0,14/0,15/0,0/1,1/1,2/1,3/1,4/1,15/1,0/2,1/2,2/2,3/2,0/3,1/3,2/3,3/3,0/4,1/4,2/4,0/5,1/5,2/5,8/5,9/5,0/6,1/6,8/6,0/7,0/8,7/8,13/8,6/9,7/9,13/9,7/10,0/11,0/12,1/12,0/13,1/13,2/13,3/13,0/14,1/14,2/14,3/14,4/14,14/14,15/14,0/15,1/15,2/15,3/15,4/15,5/15,6/15,12/15,13/15,14/15,15/15}
+    \fill[masked] (\c,\r) rectangle ++(1,1);
+  % gallery (real mid-tier test gallery #30, scaled to the 16x16 grid)
+  \begin{scope}[x=1cm, y=1cm]
+    \fill[seen, opacity=0.6] (7.750,4.006) -- (8.000,6.409) -- (5.952,7.700) -- (4.121,8.000) -- (2.784,7.173) -- (0.000,5.017) -- (1.540,2.775) -- (2.616,0.751) -- (4.596,0.310) -- (6.365,0.000) -- (7.999,1.325) -- cycle;
+    \draw[outer] (7.750,4.006) -- (8.000,6.409) -- (5.952,7.700) -- (4.121,8.000) -- (2.784,7.173) -- (0.000,5.017) -- (1.540,2.775) -- (2.616,0.751) -- (4.596,0.310) -- (6.365,0.000) -- (7.999,1.325) -- cycle;
+    \draw[hole] (3.240,4.141) -- (3.803,3.958) -- (4.297,4.212) -- (4.501,4.921) -- (4.174,5.535) -- (3.631,5.787) -- (3.152,5.499) -- (2.916,4.728) -- cycle;
+    \draw[hole] (6.893,5.075) -- (6.448,5.056) -- (6.171,4.630) -- (6.285,4.041) -- (6.650,3.868) -- (7.059,4.104) -- (7.170,4.706) -- cycle;
+    \draw[hole] (4.467,2.330) -- (4.995,2.557) -- (4.942,3.294) -- (4.551,3.654) -- (4.097,3.568) -- (3.711,3.078) -- (3.994,2.426) -- cycle;
+  \end{scope}
+  \draw[black!35, line width=0.3pt] (0,0) grid (16,16);
+  \draw[black!70] (0,0) rectangle (16,16);
+  % chosen cell (c=11, r=10) and the continuous point inside it
+  \draw[agpaccent, line width=1.4pt] (11,10) rectangle ++(1,1);
+  \node[guard, fill=agpaccent] (p) at (11.62,10.35) {};
+  \node[font=\small, anchor=north] at (8,-0.2) {$x \in [0,1]$ \;($c = 0,\dots,15$)};
+  \node[font=\small, rotate=90, anchor=south] at (-0.2,8) {$y \in [0,1]$ \;($r = 0,\dots,15$)};
+
+  % zoomed cell
+  \begin{scope}[shift={(19.5,6)}, x=3cm, y=3cm]
+    \fill[seen, opacity=0.6] (0,0) rectangle (1,1);
+    \draw[agpaccent, line width=1.4pt] (0,0) rectangle (1,1);
+    \node[guard, fill=agpaccent, label={[font=\small]above right:$(x,y)$}] at (0.62,0.35) {};
+    \draw[|<->|, black!70] (0,-0.12) -- node[below, font=\small] {$o_x \sim \mathrm{Beta}(a^x_k,b^x_k)$} (0.62,-0.12);
+    \draw[|<->|, black!70] (-0.12,0) -- node[left, font=\small, align=right] {$o_y \sim$\\$\mathrm{Beta}(a^y_k,b^y_k)$} (-0.12,0.35);
+    \draw[dotted, black!60] (0.62,0) -- (0.62,0.35) -- (0,0.35);
+    \node[font=\small, anchor=south] at (0.5,1.03) {cell $k = rG + c$, \;$(c,r) = (11,10)$};
+    \node[font=\small, anchor=north, align=center] at (0.5,-0.42)
+      {$(x,y) = \bigl(\tfrac{c+o_x}{G}, \tfrac{r+o_y}{G}\bigr)$\\$= (0.726,\, 0.647)$};
+  \end{scope}
+  \draw[black!50, densely dashed] (12,11) -- (19.5,9);
+  \draw[black!50, densely dashed] (12,10) -- (19.5,6);
+\end{tikzpicture}
+\caption{\textbf{A region is chosen discretely, the point inside it continuously.} Left: the
+$16\times16$ cell grid over the bounding box of a real gallery (mid test gallery \#30). Grey
+cells contain no free space and are masked. The policy samples a live cell (orange, $(c,r)=(11,10)$),
+then a continuous offset from that cell's two Beta distributions. Right: the offset fixes the
+exact point, here $o_x=0.62$, $o_y=0.35$. Any point in the gallery can be produced, so the
+grid organises the choice without restricting where a guard can go.}
+\label{fig:action}
+\end{figure}
+
+\paragraph{Why a distribution over regions (R2).}
+When several parts of the gallery are still uncovered, the policy should be able to aim at
+any of them. A categorical over cells assigns independent probability to every region, so it
+can put mass on two opposite corners at once. A single Gaussian over $(x,y)$, or any method
+that outputs one averaged point, cannot: its mean falls between the targets, usually in space
+that is already covered (\cref{fig:averaging}). The same holds for the deterministic action
+used in evaluation: the most probable cell is an actual choice of one region, while the mean
+of a unimodal distribution is a compromise between regions.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[x=0.32cm, y=0.32cm]
+  \begin{scope}
+    \fill[seen] (0,0) rectangle (16,16);
+    \fill[unseen] (0.5,12) rectangle (4,15.5);
+    \fill[unseen] (12,0.5) rectangle (15.5,4);
+    \draw[outer] (0,0) rectangle (16,16);
+    \foreach \s in {1.0,2.0,3.0} \draw[agpblue, line width=0.8pt] (8,8) ellipse ({\s*2.4} and {\s*2.4});
+    \node[star, star points=5, fill=agpaccent, draw=black, inner sep=1.6pt] at (8,8) {};
+    \node[font=\small, align=center, fill=white, fill opacity=0.8, text opacity=1] at (8,5.0) {mean lands in\\covered space};
+    \node[font=\small, anchor=south] at (8,16.3) {\textbf{one Gaussian over $(x,y)$}};
+    \node[font=\footnotesize] at (2.25,13.75) {pocket};
+    \node[font=\footnotesize] at (13.75,2.25) {pocket};
+  \end{scope}
+  \begin{scope}[shift={(21,0)}]
+    \fill[seen] (0,0) rectangle (16,16);
+    \fill[unseen] (0.5,12) rectangle (4,15.5);
+    \fill[unseen] (12,0.5) rectangle (15.5,4);
+    \foreach \c/\r/\o in {0/12/45,1/12/70,2/12/70,3/12/45,0/13/70,1/13/100,2/13/100,3/13/70,0/14/70,1/14/100,2/14/100,3/14/70,0/15/45,1/15/70,2/15/70,3/15/45,
+                          12/0/45,13/0/70,14/0/70,15/0/45,12/1/70,13/1/100,14/1/100,15/1/70,12/2/70,13/2/100,14/2/100,15/2/70,12/3/45,13/3/70,14/3/70,15/3/45}
+      \fill[agpaccent!\o] (\c,\r) rectangle ++(1,1);
+    \draw[black!25, line width=0.2pt] (0,0) grid (16,16);
+    \draw[outer] (0,0) rectangle (16,16);
+    \node[font=\small, align=center, fill=white, fill opacity=0.8, text opacity=1] at (8,8) {probability on\\both pockets};
+    \node[font=\small, anchor=south] at (8,16.3) {\textbf{categorical over cells}};
+  \end{scope}
+\end{tikzpicture}
+\caption{\textbf{Why the policy chooses a region instead of one averaged point.} Two
+uncovered pockets (orange) sit in opposite corners of an otherwise covered gallery
+(schematic). \emph{Left:} a single Gaussian that tries to serve both pockets centres between
+them, so its mean, the deterministic action, lands in already-covered space, and its samples
+mostly do too. \emph{Right:} the categorical over cells puts high probability (darker cells) on
+both pockets independently, so every sample aims at real work, and the most probable cell is
+one of the pockets.}
+\label{fig:averaging}
+\end{figure}
+
+\paragraph{Why a continuous offset inside the cell (R1).}
+The Beta offset makes the action continuous while keeping the density exact.
+
+\begin{proposition}[The action is continuous]\label{prop:continuous}
+For $\mu\neq\STOP$, the induced distribution of $(x,y)$ has density
+\[
+  p(x,y) \;=\; G^2\;\pi^{\mathrm{cell}}_{k(x,y)}\;
+  \mathrm{Beta}\bigl(o_x(x)\bigr)\,\mathrm{Beta}\bigl(o_y(y)\bigr)
+\]
+on $[0,1]^2$, where $k(x,y) = \lfloor Gy\rfloor G + \lfloor Gx\rfloor$,
+$o_x(x) = Gx - \lfloor Gx\rfloor$ and $o_y(y) = Gy - \lfloor Gy\rfloor$. It is positive on every
+live cell.
+\end{proposition}
+
+\begin{proof}
+Cells partition $[0,1)^2$, so each point belongs to exactly one cell and determines its
+offsets uniquely. Within a cell the map from offsets to $(x,y)$ scales each coordinate by
+$1/G$, so the Jacobian contributes $G^2$. Beta densities with parameters $\ge1$ are positive on
+$(0,1)$.
+\end{proof}
+
+The grid organises \emph{how} the policy decides; it does not restrict \emph{where} a guard
+can go. This is the difference from candidate-set solvers \cite{couto2011,tozoni2016} and
+from a plain discrete ``spatial action map'' \cite{wu2020spatial}, which would snap every
+guard to a cell centre and give up advantage (1) of \cref{sec:complexity}. The Beta
+distribution is the natural choice for a bounded offset: it lives on $(0,1)$ exactly, so no
+probability is clipped at the cell edges, which avoids the boundary bias of clipped Gaussians
+\cite{chou2017beta}.
+
+\paragraph{Log-probability, entropy, deterministic action.}
+Given a stored action $[\mu,x,y]$, the code recovers $k$, $o_x$, $o_y$ and computes
+\[
+  \log\pi(a\mid s) \;=\; \log\pi^{\mathrm{mode}}_\mu
+  \;+\; \Ind{\mu\neq\STOP}\Bigl(\log\pi^{\mathrm{cell}}_k + \log\mathrm{Beta}(o_x) + \log\mathrm{Beta}(o_y)\Bigr).
+\]
+The constant $\log G^2$ is dropped because it cancels in PPO's probability ratio. The point
+term is excluded for $\STOP$ because a $\STOP$ ignores the point, so including it would only add
+gradient noise to a decision that does not depend on it. Offsets are clamped to
+$[10^{-5}, 1-10^{-5}]$, which keeps sampled points strictly inside their cell and the Beta
+log-densities finite. The entropy bonus is that of the joint choice,
+\[
+  \mathcal{H} \;=\; \mathcal{H}(\pi^{\mathrm{mode}}) + \mathcal{H}(\pi^{\mathrm{cell}})
+  + \textstyle\sum_k \pi^{\mathrm{cell}}_k\bigl(\mathcal{H}(\mathrm{Beta}^x_k) + \mathcal{H}(\mathrm{Beta}^y_k)\bigr).
+\]
+The deterministic action used for evaluation is the most probable mode, the most probable
+cell, and the Beta means $a/(a+b)$ inside it.
+
+\subsection{The mode head across the stage switch (R5)}
+
+\paragraph{A categorical, not a number.}
+The three modes are separate logits. Moving probability from $\ADD$ to $\STOP$ does not pass
+through $\DEL$, as it would if the mode were one continuous output cut into bands: learning
+``stop once covered'' must not require first becoming worse at something else.
+
+\paragraph{Stage 1: masking at the logits.}
+The $\DEL$ and $\STOP$ logits are replaced by $-10^{8}$, so their probability is exactly zero
+and they contribute nothing to the log-probability or the entropy \cite{huang2022masking}.
+The environment also decodes every stage-1 action as $\ADD$, so the MDP is correct for any
+policy.
+
+\paragraph{Stage 2: priming.}
+Masked logits receive no gradient, so at the switch the mode head is still at its
+initialisation and would choose among the three modes arbitrarily. Instead, we zero the mode
+head's weights and set its biases so that $\pi^{\mathrm{mode}} = (0.8, 0.1, 0.1)$ in every state
+(\code{--add-prob 0.8}). Stage 2 therefore starts by behaving as stage 1 ended, mostly
+adding, while sampling $\DEL$ and $\STOP$ often enough to learn their value. The placement
+heads are left as stage 1 trained them.
+
+\subsection{PPO configuration}
+
+\begin{table}[t]
+\centering\small
+\caption{PPO settings (\code{train.py}). One model runs both stages; the step counter
+continues across the switch.}
+\label{tab:ppo}
+\begin{tabular}{ll@{\hspace{2.5em}}ll}
+\toprule
+learning rate & $3\times10^{-4}$ & discount $\gamma$ & $0.995$ \\
+environments & 16 (subprocesses) & GAE $\lambda$ & $0.95$ \\
+rollout length & 256 per env (4096 per update) & clip range & $0.2$ \\
+minibatch & 512 & epochs per update & 10 \\
+entropy coefficient & $0.005$ (stage 2: $0.01$) & value coefficient & $0.5$ \\
+gradient clip & $0.5$ & target KL & off \\
+steps & $10^6$ per stage & device & Apple MPS \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\Cref{tab:ppo} lists the settings. $\gamma = 0.995$ is close to $1$ because episodes are short
+(at most 40 steps) and the terminal bonus must reach the first placement. The entropy
+coefficient is doubled in stage 2 because two of the three modes are new. We do not stop
+updates early on a KL threshold: a cap of $0.03$ ended updates after so few gradient steps
+that the placement head barely trained. Training runs on Apple's MPS GPU: a forward and
+backward pass over 512 samples takes $12$\,ms there versus $600$\,ms on the CPU. Beta sampling,
+the one operation MPS lacks, is done on the CPU for the single offset drawn per environment
+per step. $G=16$ is a compromise: $256$ regions separate distinct pockets while keeping the
+categorical small enough to explore, and $G=32$ would double the network's cost without
+changing what positions are reachable.
+
+\subsection{Results}\label{sec:results}
+
+\takeaway{%
+\textbf{Results pending.} The two-stage run with the spatial policy
+(\code{runs/agp\_spatial}) was in progress when this report was written. \Cref{tab:results}
+is a placeholder to be filled from the final held-out evaluation (deterministic actions,
+90 test galleries).}
+
+\begin{table}[t]
+\centering\small
+\caption{Held-out evaluation of the spatial policy. \pending{: fill from \code{runs/train\_spatial.log}}}
+\label{tab:results}
+\begin{tabular}{lcccc}
+\toprule
+tier & solved & mean coverage & mean $k$ (solved) & $k/k_{\mathrm{ref}}$ (solved) \\
+\midrule
+easy & \pending{} & \pending{} & \pending{} & \pending{} \\
+mid  & \pending{} & \pending{} & \pending{} & \pending{} \\
+hard & \pending{} & \pending{} & \pending{} & \pending{} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===========================================================================
+\section{MDP formulation and reward}\label{sec:mdp}
+% ===========================================================================
+
+\Cref{fig:mdp} summarises one step of the decision process. The rest of this section states
+each part precisely.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[node distance=0.6cm and 1.0cm]
+  \node[blk, text width=4.3cm] (state) {\textbf{State} $s_t$\\gallery, guards $S_t$, step $t$,\\best coverage $c^{\mathrm{best}}_t$};
+  \node[blk, text width=4.6cm, right=1.3cm of state] (obs) {\textbf{Observation}\\image $64{\times}64{\times}5$: interior, covered,\\uncovered, guards, redundancy\\+ 5 stats: coverage, budget used,\\time used, cheapest deletion, ratchet room};
+  \node[blk, text width=4.3cm, below=1.0cm of obs] (pol) {\textbf{Policy} (\cref{fig:net})\\action $a_t = [\mu, x, y]$};
+  \node[blk, text width=4.3cm, below=1.0cm of state, fill=white] (env) {\textbf{Environment step}\\
+     $\ADD$: project into $\Free$, place guard\\
+     $\DEL$: remove nearest guard,\\unless the ratchet refuses\\
+     $\STOP$: end the episode};
+  \node[blk, text width=4.3cm, below=1.0cm of env, fill=agpaccent!12, draw=agpaccent] (rew) {\textbf{Reward} $r_t$ (exact geometry)\\coverage and guard-count potentials,\\scaffolds, penalties, terminal bonus};
+  \draw[flow] (state) -- node[above, font=\small]{render} (obs);
+  \draw[flow] (obs) -- (pol);
+  \draw[flow] (pol) -- node[above, font=\small]{$a_t$} (env);
+  \draw[flow] (env) -- (rew);
+  \draw[flow] (env.west) -- ++(-0.6,0) |- node[pos=0.25, left, font=\small]{$s_{t+1}$} (state.west);
+  \draw[flow] (rew.east) -| node[pos=0.25, below, font=\small]{to PPO} (pol.south);
+\end{tikzpicture}
+\caption{\textbf{One step of the MDP.} The state is rendered into a 5-channel image and five
+scalars; the policy outputs a mode and a point; the environment applies it with exact
+geometry and returns the next state and a reward. Transitions are deterministic; the only
+randomness is the gallery drawn at reset and the policy's own sampling.}
+\label{fig:mdp}
+\end{figure}
+
+\subsection{Instances}
+
+Each episode draws a gallery uniformly from the training set and applies a random symmetry
+of the square (one of 8 rotations and reflections about the gallery centre), which also
+transforms the stored greedy guards. Augmentation is switched off for evaluation. The
+generator (\code{polygons.py}) produces three tiers (\cref{tab:tiers}).
+
+\begin{table}[t]
+\centering\small
+\caption{Difficulty tiers. 200 training and 30 test galleries per tier.}
+\label{tab:tiers}
+\begin{tabular}{lccc}
+\toprule
+tier & outer vertices & holes & vertices per hole \\
+\midrule
+easy & 8--12  & 1--3 & 4--6 \\
+mid  & 10--16 & 2--5 & 4--8 \\
+hard & 16--26 & 5--9 & 5--10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{State, actions, termination}
+
+The state is $s_t = (\Gallery, S_t, t, c^{\mathrm{best}}_t)$: the gallery, the multiset of
+placed guards, the step count, and the best coverage reached so far in the episode. The action
+$[\mu, x, y]$ is decoded to the point $q = (x_{\min} + x\,w,\; y_{\min} + y\,h)$.
+
+\begin{description}[leftmargin=1.6em]
+  \item[$\ADD$.] If $q\notin\operatorname{int}\Free$ (outside $\Poly$ or inside a hole), it is
+        projected to the nearest boundary point and then moved towards a fixed interior
+        reference point by the first $t\in\{0.01,0.05,0.10,0.25,0.50\}$ that lands strictly
+        inside. A guard is \emph{always} placed: rejecting the action instead would leave the
+        state unchanged, and a deterministic policy that emits the same invalid point would
+        repeat it forever. The projection is penalised (\cref{sec:reward}) so the policy
+        still learns the shape.
+  \item[$\DEL$.] Removes the guard nearest to $q$. Addressing a guard by a point rather than
+        an index keeps the action fixed-size and independent of guard order, and reuses the
+        same point head as $\ADD$. Deletions are subject to a \emph{coverage ratchet}: a
+        deletion is refused (state unchanged, penalised) if it would bring coverage below
+        $c^{\mathrm{best}}_t - 0.01$. Undoing real progress is then impossible rather than
+        merely costly.
+  \item[$\STOP$.] Ends the episode with the current guard set.
+\end{description}
+
+\paragraph{Termination and truncation.}
+The episode \emph{terminates} on $\STOP$; when an $\ADD$ reaches the budget of $16$ guards;
+and, in stage 1 only, as soon as $f\ge c^\dagger$ (in stage 2 it continues so that pruning
+can happen). It is \emph{truncated} after $40$ steps. Truncation is a safety net, not part of
+the problem: no terminal reward is paid, and PPO bootstraps from the value function instead,
+which would double-count if we also paid out.
+
+\paragraph{Why a budget of 16.}
+Greedy needs at most $11$ guards on any training gallery, so $16$ leaves room for stage 1 to
+over-fill and stage 2 to prune. It is tight enough that guard placement still matters, and
+the observation reports the fraction of budget used. The reward sizes in \cref{sec:calib}
+are checked against this value and must be rechecked if it changes.
+
+\subsection{Observation}\label{sec:obs}
+
+\begin{table}[t]
+\centering\small
+\caption{Observation. Image channels are $0/255$ masks except channel 4.}
+\label{tab:obs}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+\multicolumn{2}{l}{\emph{Image channels} ($64\times64$ over the bounding box)} \\
+0 interior & pixels inside $\Free$ \\
+1 covered & pixels seen by at least one guard \\
+2 uncovered & interior pixels seen by no guard: the work left \\
+3 guards & each guard as a $3\times3$ blob, so it survives strided convolutions \\
+4 redundancy & each guard's blob shaded by $\min(1, \hat\delta^-_j/\sigma_p)$, where
+$\hat\delta^-_j$ is the raster estimate of its exclusive area and $\sigma_p = 0.005$; dark
+means nearly free to delete \\
+\midrule
+\multicolumn{2}{l}{\emph{Scalars} (all clipped to $[0,1]$)} \\
+coverage & exact $f(S_t)$ \\
+budget used & $k_t/16$ \\
+time used & $t/40$ \\
+cheapest deletion & $\min(1, \min_j \hat\delta^-_j/\sigma_p)$; $0$ means a free deletion exists now \\
+ratchet room & $f(S_t) - (c^{\mathrm{best}}_t - 0.01)$: coverage a deletion may still cost \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\Cref{tab:obs} lists the observation. Channel 2 tells the policy where the work is; channel 4
+is what makes $\DEL$ learnable at all, since without it a load-bearing guard and a redundant
+one look identical. The raster estimate $\hat\delta^-_j$ counts pixels seen by guard $j$ and
+by no other guard, one vectorised operation per guard. The exact $\delta^-$, a polygon union
+over the other guards, is computed only when a deletion actually happens, for the reward and
+the ratchet.
+
+\subsection{Reward}\label{sec:reward}
+
+Let $g$ be the placed (projected) point, $\iota = \Ind{q \notin \operatorname{int}\Free}$,
+$D$ the bounding-box diagonal and $j^\star$ the guard nearest $q$. The per-step reward is
+\[
+r_t \;=\;
+\begin{cases}
+  w_{\mathrm{cov}}\,\delta^+ - w_{\mathrm{par}} - w_{\mathrm{proj}}\,\iota + r^{\mathrm{scaf}}_t, & \mu=\ADD, \\[4pt]
+  -w_{\mathrm{cov}}\,\delta^-_{j^\star} + w_{\mathrm{par}}
+  + w_{\mathrm{prune}}\exp\!\bigl(-\delta^-_{j^\star}/\sigma_p\bigr), & \mu=\DEL\text{, accepted}, \\[4pt]
+  -w_{\mathrm{void}}, & \mu=\DEL\text{, refused or no guards}, \\[4pt]
+  -w_{\mathrm{stop}}\Ind{f(S_t) < c^\dagger}, & \mu=\STOP,
+\end{cases}
+\]
+plus, on termination only,
+\[
+  r^{\mathrm{term}} \;=\;
+  \begin{cases}
+    w_{\mathrm{goal}} + w_{\mathrm{pars}}\max(k_{\mathrm{ref}} - k_T,\, 0), & f(S_T)\ge c^\dagger,\\
+    -w_{\mathrm{fail}}, & \text{otherwise.}
+  \end{cases}
+\]
+where the scaffold reward of a placement is
+\[
+  r^{\mathrm{scaf}}_t \;=\; w_{\mathrm{front}}\Ind{g\notin\Cov(S_t)} + w_{\mathrm{sweep}}\,\kappa_t(g)
+  - w_{\mathrm{sep}}\Ind{\textstyle\min_j\lVert g-g_j\rVert < 0.15\,D}.
+\]
+The sweep kernel favours the wall early and the interior later:
+$\kappa_t(g) = \exp\bigl(-(\dbd(g)/D - m_t)^2/(2\cdot0.05^2)\bigr)$ with
+$m_t = 0.02 + 0.23\,k_t/16$. \Cref{tab:weights} gives every weight;
+\cref{fig:curriculum} shows how they move over training.
+
+\begin{table}[t]
+\centering\small
+\caption{Reward terms and their weights (\code{rewards.py}). ``Potential'' marks the terms
+that are differences of the potential in \cref{sec:shaping}.}
+\label{tab:weights}
+\begin{tabularx}{\linewidth}{llXcc}
+\toprule
+group & weight & role & \stageI{} & \stageII{} \\
+\midrule
+coverage   & $w_{\mathrm{cov}}$   & area gained / lost (potential) & 1.0 & 1.0 \\
+           & $w_{\mathrm{goal}}$  & terminal bonus for $f\ge c^\dagger$ & 4.0 & 4.0 \\
+           & $w_{\mathrm{fail}}$  & terminal penalty otherwise & 2.0 & 2.0 \\
+parsimony  & $w_{\mathrm{par}}$   & cost per guard, refunded on deletion (potential) & 0 & 0.15 \\
+           & $w_{\mathrm{prune}}$ & bonus for a deletion that loses no area & 0 & 0.20 \\
+           & $w_{\mathrm{pars}}$  & terminal bonus per guard saved vs.\ $k_{\mathrm{ref}}$ & 0 & 0.50 \\
+scaffolds  & $w_{\mathrm{front}}$ & guard placed in uncovered space & 0.04 & 0 \\
+           & $w_{\mathrm{sweep}}$ & boundary-first, then inward & 0.06 & 0 \\
+           & $w_{\mathrm{sep}}$   & penalty for a guard within $0.15D$ of another & 0.10 & 0 \\
+regularity & $w_{\mathrm{proj}}$  & aimed outside $\Free$ & 0.25 & 0.25 \\
+           & $w_{\mathrm{void}}$  & impossible or refused deletion & 0 & 0.10 \\
+           & $w_{\mathrm{stop}}$  & $\STOP$ before $c^\dagger$ & 0 & 2.0 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Why each group exists.}
+The coverage and parsimony potentials carry the objective (\cref{sec:shaping}). The terminal
+terms make crossing $c^\dagger$ the thing that matters, and $w_{\mathrm{pars}}$ rewards beating
+greedy, never punishing a match. The scaffolds make early coverage learning fast: aim at
+uncovered space, trace the boundary first, do not stack guards; being non-potential, they are
+removed before stage 1 ends. The regularity terms keep actions meaningful: aim inside the
+gallery, do not request impossible deletions, do not stop short.
+
+\subsection{Schedule}\label{sec:schedule}
+
+\begin{itemize}
+  \item \textbf{Stage 1.} The scaffolds hold full weight for the first $70\%$ of the stage
+        and then fall linearly to $0$ at its end (\cref{fig:curriculum}).
+  \item \textbf{Stage 2.} The weights blend linearly from the stage-1 column (scaffolds at
+        zero) to the stage-2 column over the first $5\%$ of the stage, so the value function
+        is not hit by a step change in its targets. $40\%$ of stage-2 episodes start
+        \emph{presaturated}: the stored greedy cover plus $4$ guards at random interior
+        points. Those extras are redundant by construction, so free deletions exist from the
+        first step and $\DEL$ gets a dense learning signal.
+  \item A callback pushes the current weights to every environment every 4096 steps; the
+        environment has no notion of stage beyond its weights and the \code{allow\_delete}
+        flag.
+\end{itemize}
+
+\subsection{Weight calibration}\label{sec:calib}
+
+The weights are sized so that no shortcut beats solving the gallery.
+\begin{itemize}
+  \item \textbf{No scaffold farming (stage 1).} $w_{\mathrm{front}} + w_{\mathrm{sweep}} \le
+        0.10$ per placement, so a full budget of 16 earns at most $1.6$ in scaffolds, well
+        below the $4$ for reaching $c^\dagger$ plus the $2$ for avoiding failure.
+  \item \textbf{Parsimony never makes failure attractive (stage 2).} A full budget costs
+        $16\times0.15 = 2.4$, less than the $w_{\mathrm{goal}}+w_{\mathrm{fail}} = 6$ swing
+        between solving and failing.
+  \item \textbf{Pruning is worth doing.} A free deletion returns
+        $w_{\mathrm{par}} + w_{\mathrm{prune}} = 0.35$, large relative to per-step noise, and
+        the bonus decays as $\exp(-\delta^-/0.005)$, by a factor $e$ for every half percent of
+        the gallery lost.
+  \item \textbf{Stopping early is costly.} $\STOP$ below $c^\dagger$ costs $w_{\mathrm{stop}} =
+        2$ plus the $w_{\mathrm{fail}} = 2$ terminal penalty.
+\end{itemize}
+
+\paragraph{A known weakness: an add--delete cycle.}
+The prune bonus is not potential-based. In stage 2, adding a guard in already covered space
+earns $-w_{\mathrm{par}} = -0.15$, and immediately deleting it earns $w_{\mathrm{par}} +
+w_{\mathrm{prune}} = 0.35$: a net $+0.20$ per two steps, which over a 40-step episode can
+approach the goal bonus. The bonus is bounded per deletion but not per episode. Candidate
+fixes are to pay it only for guards that were present at the start of the episode or before
+the last $\ADD$, to cap it per episode, or to anneal it to zero late in stage 2 as
+\cref{rule:anneal} requires of non-potential terms. Stage-2 rollouts should be checked for
+this behaviour.
+
+% ===========================================================================
+\section{Optional stage 3: relocation}\label{sec:stage3}
+% ===========================================================================
+
+Stage 2 can only remove guards that are already redundant. It cannot move a guard so that a
+\emph{neighbour} becomes redundant, which is where the remaining gap to the optimum lies, and
+which greedy, never revisiting a choice, cannot do either. A third stage would add a $\MOVE$
+mode: select the guard nearest to the chosen point and displace it by a bounded continuous
+vector. Delete-then-add cannot substitute for it, because the ratchet refuses to delete any
+guard that alone covers more than $1\%$ of the gallery.
+
+What it would need:
+\begin{itemize}
+  \item \textbf{A displacement head.} The spatial policy accommodates this naturally: a second
+        pair of Beta maps per cell gives a bounded displacement for the guard selected in that
+        cell, and the log-probability factorises as in \cref{sec:action}.
+  \item \textbf{Reward.} The coverage potential already values a move correctly as
+        $w_{\mathrm{cov}}(f(S') - f(S))$, and the guard count does not change, so no new
+        reward term is needed.
+  \item \textbf{Ratchet interaction.} A move that lowers coverage below
+        $c^{\mathrm{best}}-0.01$ should be refused like a deletion, or the slack widened for
+        moves, since a good relocation can pass through a temporary loss.
+  \item \textbf{Constraint-based regularity.} The curriculum design proposes moving the
+        regularity terms into a per-step constraint solved with N-P3O or CPO
+        \cite{lee2023constrained,achiam2017cpo}, with threshold $h = 1.5\times$ the greedy
+        solver's mean per-step regularity cost. A fixed penalty is negligible next to the
+        first guard's gain but dominant next to the last sliver's, which suppresses exactly
+        the delicate end-game moves stage 3 is for.
+  \item \textbf{Hard-instance sampling.} Reweight the tiers towards hard galleries and sample
+        instances in proportion to their recent failure rate.
+  \item \textbf{A stronger reference.} Claiming a gap to the optimum rather than to greedy
+        needs an exact or near-exact solver \cite{couto2011,tozoni2016} on a sample of
+        galleries.
+\end{itemize}
+
+The prerequisite is that stage 2 prunes reliably. Relocation exists to remove guards that
+pruning cannot; if pruning does not yet work, adding $\MOVE$ doubles the continuous action
+dimension without addressing the actual bottleneck.
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}

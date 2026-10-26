@@ -1,0 +1,10 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tensorboard",
+      "url": "http://localhost:6006",
+      "port": 6006
+    }
+  ]
+}
