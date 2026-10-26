@@ -1,6 +1,6 @@
-# Build the AGP MDP / curriculum design notes.
+# Build the AGP MDP / curriculum design notes and the technical report.
 #
-#   make          build both PDFs and copy them up into docs/
+#   make          build all three PDFs and copy them up into docs/
 #   make clean    remove build intermediates (keeps the PDFs)
 #   make purge    remove intermediates and PDFs
 #
@@ -9,7 +9,7 @@
 
 TEX      := tectonic
 TEXFLAGS := --keep-intermediates --keep-logs
-DOCS     := agp_mdp_formulation agp_staged_ppo_curriculum
+DOCS     := agp_mdp_formulation agp_staged_ppo_curriculum agp_paper
 PDFS     := $(addsuffix .pdf,$(DOCS))
 OUTDIR   := ..
 JUNK     := aux log bbl blg out xdv toc

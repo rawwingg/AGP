@@ -148,6 +148,7 @@ class ArtGalleryEnv(gym.Env):
         # --- 3. episode bookkeeping ---
         self.step_count = 0
         self.best_coverage = self.gallery.coverage
+        self.redundancy = self._redundancy()
         self.episode_return = 0.0
 
         return self._observation(), {}
@@ -237,10 +238,9 @@ class ArtGalleryEnv(gym.Env):
                 else:
                     delta_minus = self.gallery.remove_guard(index)
                     # Mirror of the Add case: coverage potential down, guard-count
-                    # potential up, plus a bounded bonus for a near-free removal.
-                    reward += (-weights.cov * delta_minus
-                               + weights.par
-                               + weights.prune * math.exp(-delta_minus / self.shape.sigma_prune))
+                    # potential up. The reward for removing a redundant guard is
+                    # the redundancy potential below, paid on every step.
+                    reward += -weights.cov * delta_minus + weights.par
                     info["delta"] = -delta_minus
 
         # =================== STOP ==========================================
@@ -248,6 +248,15 @@ class ArtGalleryEnv(gym.Env):
             terminated = True
             if self.gallery.coverage < self.config.coverage_threshold:
                 reward -= weights.stop      # stopping short of the goal
+
+        # --- redundancy potential -------------------------------------------
+        # Paid as a difference of potentials, so it telescopes over an episode
+        # and cannot be farmed: adding a redundant guard costs exactly what
+        # deleting it pays back. A per-deletion bonus could be -- add a useless
+        # guard (-par), delete it (+par +prune), repeat -- for +prune a cycle.
+        redundancy = self._redundancy()
+        reward += weights.prune * (self.redundancy - redundancy)
+        self.redundancy = redundancy
 
         # --- episode limits and terminal reward ----------------------------
         self.step_count += 1
@@ -282,6 +291,17 @@ class ArtGalleryEnv(gym.Env):
         # agent is rewarded for beating greedy, not punished for matching it.
         saved = max(self.k_ref - self.gallery.n_guards, 0)
         return self.weights.goal + self.weights.pars * saved
+
+    def _redundancy(self) -> float:
+        """
+        Soft count of redundant guards: sum over guards of exp(-delta_minus / sigma).
+
+        A guard that sees nothing on its own counts as 1, one that alone covers
+        well over sigma of the gallery counts as ~0. The prune reward is paid on
+        changes in this number.
+        """
+        deficits = self.gallery.exclusive_areas()
+        return float(np.exp(-deficits / self.shape.sigma_prune).sum())
 
     def _sweep_kernel(self, wall_distance: float) -> float:
         """

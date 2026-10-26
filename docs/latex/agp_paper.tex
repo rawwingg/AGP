@@ -4,6 +4,15 @@
 \pgfplotsset{compat=1.17}
 \usepgfplotslibrary{fillbetween}
 \usetikzlibrary{patterns,shapes.geometric}
+\usepackage[section]{placeins}   % keep each section's floats inside that section
+
+% Let large figures sit next to their text instead of drifting to the end.
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.8}
+\renewcommand{\textfraction}{0.07}
+\renewcommand{\floatpagefraction}{0.75}
+\setcounter{topnumber}{3}
+\setcounter{totalnumber}{4}
 
 \title{\bfseries Reinforcement Learning for the Continuous Art Gallery Problem\\[4pt]
 \large Preliminaries, Policy Architecture, and MDP Formulation}
@@ -98,7 +107,7 @@ are captured. Each ray is $3\times$ the bounding-box diagonal long, so effective
 and is cut at its first boundary hit. The hits, taken in angular order, form $\Vis(g)$,
 which is clipped back to $\Free$.
 
-\begin{figure}[t]
+\begin{figure}[!htbp]
 \centering
 \begin{tikzpicture}[scale=0.95]
   % free space, all visible to start with
@@ -115,8 +124,8 @@ which is clipped back to $\Free$.
   \node[guard, label={[font=\small]below:$g$}] at (1.5,2.5) {};
   \node[font=\small] at (4.5,2.5) {hole};
   \node[font=\small, align=center] at (6.7,2.5) {shadow\\of the hole};
-  \node[font=\small, anchor=west, align=left] (rc) at (8.4,4.6) {hidden behind\\a reflex corner};
-  \draw[-Stealth, black!60] (rc.west) -- (2.35,4.8);
+  \node[font=\small, anchor=west] (rc) at (3.2,5.55) {hidden behind a reflex corner};
+  \draw[-Stealth, black!60] (rc.west) -- (2.3,4.85);
   \node[font=\small, anchor=west] (vs) at (8.4,0.6) {$\Vis(g)$};
   \draw[-Stealth, black!60] (vs.west) -- (6.5,0.5);
 \end{tikzpicture}
@@ -208,7 +217,7 @@ Apply \cref{prop:submod} to $S_{j-1}\subseteq S_K\setminus\{g_j\}$.
 as guards are added, and the second guard, which added $28\%$ of the gallery when it was
 placed, ends up with an exclusive area of zero.
 
-\begin{figure}[t]
+\begin{figure}[!htbp]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
@@ -282,7 +291,7 @@ NP-hard to compute. A guard ratio below $1$ means beating greedy, not proving op
 On the training set, $k_{\mathrm{greedy}}$ ranges over $1$--$3$ (easy), $2$--$5$ (mid) and
 $3$--$11$ (hard). Mean test-set values are in \cref{tab:greedy}.
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering\small
 \caption{Greedy baseline on the 90 test galleries (30 per tier).}
 \label{tab:greedy}
@@ -349,32 +358,33 @@ before training ends.
 guard-count terms stay on, and the stage-1 scaffolds (frontier, sweep, separation) are
 annealed to zero.
 
-\begin{figure}[t]
+\begin{figure}[!htbp]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
-  width=\linewidth, height=6.2cm,
-  xmin=0, xmax=2.5, ymin=0, ymax=0.25,
+  width=0.96\linewidth, height=6.4cm,
+  xmin=0, xmax=2.5, ymin=0, ymax=0.30,
   xlabel={training steps ($\times 10^6$)}, ylabel={reward weight},
   xtick={0,0.5,0.7,1,1.05,1.5,2}, xticklabels={0,0.5,0.7,1,,1.5,2},
-  ytick={0,0.04,0.06,0.10,0.15,0.20},
+  ytick={0,0.05,0.10,0.15,0.20},
+  yticklabel style={/pgf/number format/fixed, /pgf/number format/precision=2},
   tick label style={font=\small}, label style={font=\small},
   legend style={font=\small, draw=none, fill=white, fill opacity=0.85, text opacity=1,
                 at={(0.5,1.02)}, anchor=south, legend columns=5},
   every axis plot/.append style={thick}]
   % stage backgrounds
-  \fill[agpblue!6]   (axis cs:0,0)   rectangle (axis cs:1,0.25);
-  \fill[agpgreen!8]  (axis cs:1,0)   rectangle (axis cs:2,0.25);
-  \fill[pattern=north east lines, pattern color=black!12] (axis cs:2,0) rectangle (axis cs:2.5,0.25);
+  \fill[agpblue!6]   (axis cs:0,0)   rectangle (axis cs:1,0.30);
+  \fill[agpgreen!8]  (axis cs:1,0)   rectangle (axis cs:2,0.30);
+  \fill[pattern=north east lines, pattern color=black!12] (axis cs:2,0) rectangle (axis cs:2.5,0.30);
   \addplot[agpblue]                 coordinates {(0,0.10) (0.7,0.10) (1,0) (2,0)};
   \addplot[agpblue, dashed]         coordinates {(0,0.06) (0.7,0.06) (1,0) (2,0)};
   \addplot[agpblue, dotted]         coordinates {(0,0.04) (0.7,0.04) (1,0) (2,0)};
   \addplot[agpaccent]               coordinates {(0,0) (1,0) (1.05,0.15) (2,0.15)};
   \addplot[agpaccent, dashed]       coordinates {(0,0) (1,0) (1.05,0.20) (2,0.20)};
   \legend{$w_{\mathrm{sep}}$, $w_{\mathrm{sweep}}$, $w_{\mathrm{front}}$, $w_{\mathrm{par}}$, $w_{\mathrm{prune}}$}
-  \node[font=\small, align=center] at (axis cs:0.35,0.215) {\textbf{Stage 1: \stageI{}}\\only $\ADD$; guards free};
-  \node[font=\small, align=center] at (axis cs:1.5,0.215) {\textbf{Stage 2: \stageII{}}\\$\ADD$, $\DEL$, $\STOP$; guards cost};
-  \node[font=\small, align=center] at (axis cs:2.25,0.215) {\textbf{Stage 3}\\(optional)\\$+\MOVE$};
+  \node[font=\small, align=center] at (axis cs:0.4,0.262) {\textbf{Stage 1: \stageI{}}\\only $\ADD$; guards free};
+  \node[font=\small, align=center] at (axis cs:1.5,0.262) {\textbf{Stage 2: \stageII{}}\\$\ADD$, $\DEL$, $\STOP$; guards cost};
+  \node[font=\small, align=center] at (axis cs:2.25,0.255) {\textbf{Stage 3}\\(optional)\\$+\MOVE$};
   \node[font=\footnotesize, align=center] at (axis cs:0.85,0.135) {scaffolds\\annealed};
   \node[font=\footnotesize, align=left, anchor=west] at (axis cs:1.08,0.045) {5\% blend; 40\% of episodes start\\from greedy cover $+\,4$ spares};
 \end{axis}
@@ -424,30 +434,30 @@ cells, and a second branch summarises the whole gallery into one vector that is 
 every cell. The mode and the value of the state, which are properties of the whole gallery,
 are read from the summary.
 
-\begin{figure}[t]
+\begin{figure}[!htbp]
 \centering
 \begin{tikzpicture}[node distance=0.55cm]
-  \node[blk, text width=4.6cm] (in) {\textbf{Input} $64{\times}64{\times}7$\\5 image channels + $x$, $y$ coordinates};
-  \node[blk, text width=4.6cm, below=of in] (l1) {conv $5{\times}5$, stride 2 $\;\to 32{\times}32{\times}32$};
-  \node[blk, text width=4.6cm, below=of l1] (l2) {conv $3{\times}3$, stride 2 $\;\to 16{\times}16{\times}32$};
-  \node[blk, text width=4.6cm, below=of l2] (l3) {conv $3{\times}3$ $\;\to$ \textbf{cell features} $16{\times}16{\times}32$};
-  \node[blk, text width=4.6cm, below=1.3cm of l3] (cat) {concat $\;\to 16{\times}16{\times}64$};
-  \node[blk, text width=4.6cm, below=of cat] (c1) {\textbf{Cell head}: conv $3{\times}3$, conv $3{\times}3$ $\to 16{\times}16{\times}32$\\conv $1{\times}1$ $\;\to 16{\times}16{\times}5$};
-  \node[blk, text width=4.6cm, below=of c1, fill=agpaccent!12, draw=agpaccent] (out) {per cell $k$: score $s_k$ and\\Beta parameters $a^x_k, b^x_k, a^y_k, b^y_k$};
+  \node[blk, text width=5.0cm] (in) {\textbf{Input} $64{\times}64{\times}7$\\5 image channels $+$ $x$, $y$ coordinates};
+  \node[blk, text width=5.0cm, below=of in] (l1) {conv $5{\times}5$/2 $\;\to\; 32{\times}32{\times}32$};
+  \node[blk, text width=5.0cm, below=of l1] (l2) {conv $3{\times}3$/2 $\;\to\; 16{\times}16{\times}32$};
+  \node[blk, text width=5.0cm, below=of l2] (l3) {conv $3{\times}3$ $\;\to\;$ \textbf{cell features}\\$16{\times}16{\times}32$};
+  \node[blk, text width=5.0cm, below=1.3cm of l3] (cat) {concat $\;\to\; 16{\times}16{\times}64$};
+  \node[blk, text width=5.0cm, below=of cat] (c1) {\textbf{Cell head}\\$2\times$ conv $3{\times}3$ $\to 16{\times}16{\times}32$\\conv $1{\times}1$ $\to 16{\times}16{\times}5$};
+  \node[blk, text width=5.0cm, below=of c1, fill=agpaccent!12, draw=agpaccent] (out) {per cell $k$: score $s_k$ and\\Beta parameters $a^x_k, b^x_k, a^y_k, b^y_k$};
 
-  \node[blk, text width=4.4cm, right=1.6cm of l3] (g1) {conv $3{\times}3$/2 $\to 8{\times}8$;\; conv $3{\times}3$/2 $\to 4{\times}4{\times}32$};
-  \node[blk, text width=4.4cm, below=of g1] (g2) {flatten 512 $\to$ FC 256;\\concat 5 stats $\to$ FC 256};
-  \node[blk, text width=4.4cm, below=of g2, fill=agpblue!15] (z) {\textbf{global summary} $z\in\Real^{256}$};
-  \node[blk, text width=4.4cm, below=of z] (bc) {broadcast: FC $\to 32$, copied to all $16{\times}16$ cells};
-  \node[blk, text width=4.4cm, below=1.1cm of bc, fill=agpaccent!12, draw=agpaccent] (mode) {\textbf{Mode head} FC $\to 3$ logits\\$\ADD$ / $\DEL$ / $\STOP$};
-  \node[blk, text width=4.4cm, below=of mode, fill=agpaccent!12, draw=agpaccent] (val) {\textbf{Value head} FC 64, tanh, FC $\to V(s)$};
+  \node[blk, text width=4.6cm, right=1.2cm of l3] (g1) {conv $3{\times}3$/2 $\to 8{\times}8{\times}32$\\conv $3{\times}3$/2 $\to 4{\times}4{\times}32$};
+  \node[blk, text width=4.6cm, below=of g1] (g2) {flatten $512$ $\to$ FC $256$\\concat 5 stats $\to$ FC $256$};
+  \node[blk, text width=4.6cm, below=of g2, fill=agpblue!15] (z) {\textbf{global summary} $z\in\Real^{256}$};
+  \node[blk, text width=4.6cm, below=of z] (bc) {\textbf{broadcast}: FC $\to 32$,\\copied to all $16{\times}16$ cells};
+  \node[blk, text width=4.6cm, below=1.1cm of bc, fill=agpaccent!12, draw=agpaccent] (mode) {\textbf{Mode head}: FC $\to$ 3 logits\\$\ADD$ / $\DEL$ / $\STOP$};
+  \node[blk, text width=4.6cm, below=of mode, fill=agpaccent!12, draw=agpaccent] (val) {\textbf{Value head}: FC 64, tanh, FC $\to V(s)$};
 
-  \node[blk, text width=3.2cm, left=1.0cm of l3, fill=white] (mask) {interior mask:\\max-pool channel 0\\$\to 16{\times}16$};
+  \node[blk, text width=2.3cm, left=0.6cm of l3, fill=white] (mask) {interior mask\\max-pool ch.\ 0\\$\to 16{\times}16$};
 
   \draw[flow] (in) -- (l1); \draw[flow] (l1) -- (l2); \draw[flow] (l2) -- (l3);
   \draw[flow] (l3) -- (cat); \draw[flow] (cat) -- (c1); \draw[flow] (c1) -- (out);
   \draw[flow] (l3) -- (g1); \draw[flow] (g1) -- (g2); \draw[flow] (g2) -- (z);
-  \draw[flow] (z) -- (bc); \draw[flow] (bc) |- (cat);
+  \draw[flow] (z) -- (bc); \draw[flow] (bc.west) -- ++(-0.6,0) |- (cat.east);
   \draw[flow] (z.east) -- ++(0.4,0) |- (mode.east);
   \draw[flow] (z.east) -- ++(0.4,0) |- (val.east);
   \draw[flow] (in.west) -| (mask.north);
@@ -520,7 +530,7 @@ samples
 \]
 and sends the vector $[\mu, x, y]$ to the environment (\cref{fig:action}).
 
-\begin{figure}[t]
+\begin{figure}[!htbp]
 \centering
 \begin{tikzpicture}[x=0.5cm, y=0.5cm]
   % dead cells
@@ -546,12 +556,12 @@ and sends the vector $[\mu, x, y]$ to the environment (\cref{fig:action}).
   \begin{scope}[shift={(19.5,6)}, x=3cm, y=3cm]
     \fill[seen, opacity=0.6] (0,0) rectangle (1,1);
     \draw[agpaccent, line width=1.4pt] (0,0) rectangle (1,1);
-    \node[guard, fill=agpaccent, label={[font=\small]above right:$(x,y)$}] at (0.62,0.35) {};
-    \draw[|<->|, black!70] (0,-0.12) -- node[below, font=\small] {$o_x \sim \mathrm{Beta}(a^x_k,b^x_k)$} (0.62,-0.12);
-    \draw[|<->|, black!70] (-0.12,0) -- node[left, font=\small, align=right] {$o_y \sim$\\$\mathrm{Beta}(a^y_k,b^y_k)$} (-0.12,0.35);
     \draw[dotted, black!60] (0.62,0) -- (0.62,0.35) -- (0,0.35);
+    \draw[<->, black!75] (0.02,0.07) -- node[above, font=\small] {$o_x$} (0.62,0.07);
+    \draw[<->, black!75] (0.75,0.02) -- node[right, font=\small] {$o_y$} (0.75,0.35);
+    \node[guard, fill=agpaccent, label={[font=\small]above:$(x,y)$}] at (0.62,0.35) {};
     \node[font=\small, anchor=south] at (0.5,1.03) {cell $k = rG + c$, \;$(c,r) = (11,10)$};
-    \node[font=\small, anchor=north, align=center] at (0.5,-0.42)
+    \node[font=\small, anchor=north, align=center] at (0.5,-0.08)
       {$(x,y) = \bigl(\tfrac{c+o_x}{G}, \tfrac{r+o_y}{G}\bigr)$\\$= (0.726,\, 0.647)$};
   \end{scope}
   \draw[black!50, densely dashed] (12,11) -- (19.5,9);
@@ -560,8 +570,9 @@ and sends the vector $[\mu, x, y]$ to the environment (\cref{fig:action}).
 \caption{\textbf{A region is chosen discretely, the point inside it continuously.} Left: the
 $16\times16$ cell grid over the bounding box of a real gallery (mid test gallery \#30). Grey
 cells contain no free space and are masked. The policy samples a live cell (orange, $(c,r)=(11,10)$),
-then a continuous offset from that cell's two Beta distributions. Right: the offset fixes the
-exact point, here $o_x=0.62$, $o_y=0.35$. Any point in the gallery can be produced, so the
+then a continuous offset from that cell's two Beta distributions,
+$o_x\sim\mathrm{Beta}(a^x_k,b^x_k)$ and $o_y\sim\mathrm{Beta}(a^y_k,b^y_k)$. Right: the offset fixes
+the exact point, here $o_x=0.62$, $o_y=0.35$. Any point in the gallery can be produced, so the
 grid organises the choice without restricting where a guard can go.}
 \label{fig:action}
 \end{figure}
@@ -575,7 +586,7 @@ that is already covered (\cref{fig:averaging}). The same holds for the determini
 used in evaluation: the most probable cell is an actual choice of one region, while the mean
 of a unimodal distribution is a compromise between regions.
 
-\begin{figure}[t]
+\begin{figure}[!htbp]
 \centering
 \begin{tikzpicture}[x=0.32cm, y=0.32cm]
   \begin{scope}
@@ -683,7 +694,7 @@ heads are left as stage 1 trained them.
 
 \subsection{PPO configuration}
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering\small
 \caption{PPO settings (\code{train.py}). One model runs both stages; the step counter
 continues across the switch.}
@@ -720,7 +731,7 @@ changing what positions are reachable.
 is a placeholder to be filled from the final held-out evaluation (deterministic actions,
 90 test galleries).}
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering\small
 \caption{Held-out evaluation of the spatial policy. \pending{: fill from \code{runs/train\_spatial.log}}}
 \label{tab:results}
@@ -742,22 +753,19 @@ hard & \pending{} & \pending{} & \pending{} & \pending{} \\
 \Cref{fig:mdp} summarises one step of the decision process. The rest of this section states
 each part precisely.
 
-\begin{figure}[t]
+\begin{figure}[!htbp]
 \centering
-\begin{tikzpicture}[node distance=0.6cm and 1.0cm]
-  \node[blk, text width=4.3cm] (state) {\textbf{State} $s_t$\\gallery, guards $S_t$, step $t$,\\best coverage $c^{\mathrm{best}}_t$};
-  \node[blk, text width=4.6cm, right=1.3cm of state] (obs) {\textbf{Observation}\\image $64{\times}64{\times}5$: interior, covered,\\uncovered, guards, redundancy\\+ 5 stats: coverage, budget used,\\time used, cheapest deletion, ratchet room};
-  \node[blk, text width=4.3cm, below=1.0cm of obs] (pol) {\textbf{Policy} (\cref{fig:net})\\action $a_t = [\mu, x, y]$};
-  \node[blk, text width=4.3cm, below=1.0cm of state, fill=white] (env) {\textbf{Environment step}\\
-     $\ADD$: project into $\Free$, place guard\\
-     $\DEL$: remove nearest guard,\\unless the ratchet refuses\\
-     $\STOP$: end the episode};
-  \node[blk, text width=4.3cm, below=1.0cm of env, fill=agpaccent!12, draw=agpaccent] (rew) {\textbf{Reward} $r_t$ (exact geometry)\\coverage and guard-count potentials,\\scaffolds, penalties, terminal bonus};
+\begin{tikzpicture}
+  \node[blk, text width=5.6cm] (state) at (0,0) {\textbf{State} $s_t$\\gallery, guards $S_t$, step $t$,\\best coverage so far $c^{\mathrm{best}}_t$};
+  \node[blk, text width=5.6cm] (obs) at (7.4,0) {\textbf{Observation}\\image $64{\times}64{\times}5$: interior, covered,\\uncovered, guards, redundancy\\5 stats: coverage, budget, time,\\cheapest deletion, ratchet room};
+  \node[blk, text width=5.6cm] (pol) at (7.4,-3.0) {\textbf{Policy} (\cref{fig:net})\\action $a_t = [\mu, x, y]$};
+  \node[blk, text width=5.6cm, fill=white] (env) at (0,-3.0) {\textbf{Environment step}\\$\ADD$: project into $\Free$, place a guard\\$\DEL$: remove the nearest guard,\\unless the ratchet refuses\\$\STOP$: end the episode};
+  \node[blk, text width=5.6cm, fill=agpaccent!12, draw=agpaccent] (rew) at (0,-5.9) {\textbf{Reward} $r_t$ (exact geometry)\\potentials for coverage and guards,\\scaffolds, penalties, terminal bonus};
   \draw[flow] (state) -- node[above, font=\small]{render} (obs);
   \draw[flow] (obs) -- (pol);
   \draw[flow] (pol) -- node[above, font=\small]{$a_t$} (env);
   \draw[flow] (env) -- (rew);
-  \draw[flow] (env.west) -- ++(-0.6,0) |- node[pos=0.25, left, font=\small]{$s_{t+1}$} (state.west);
+  \draw[flow] (env.west) -- ++(-0.5,0) |- node[pos=0.25, left, font=\small]{$s_{t+1}$} (state.west);
   \draw[flow] (rew.east) -| node[pos=0.25, below, font=\small]{to PPO} (pol.south);
 \end{tikzpicture}
 \caption{\textbf{One step of the MDP.} The state is rendered into a 5-channel image and five
@@ -774,7 +782,7 @@ of the square (one of 8 rotations and reflections about the gallery centre), whi
 transforms the stored greedy guards. Augmentation is switched off for evaluation. The
 generator (\code{polygons.py}) produces three tiers (\cref{tab:tiers}).
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering\small
 \caption{Difficulty tiers. 200 training and 30 test galleries per tier.}
 \label{tab:tiers}
@@ -827,7 +835,7 @@ are checked against this value and must be rechecked if it changes.
 
 \subsection{Observation}\label{sec:obs}
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering\small
 \caption{Observation. Image channels are $0/255$ masks except channel 4.}
 \label{tab:obs}
@@ -891,7 +899,7 @@ $\kappa_t(g) = \exp\bigl(-(\dbd(g)/D - m_t)^2/(2\cdot0.05^2)\bigr)$ with
 $m_t = 0.02 + 0.23\,k_t/16$. \Cref{tab:weights} gives every weight;
 \cref{fig:curriculum} shows how they move over training.
 
-\begin{table}[t]
+\begin{table}[!htbp]
 \centering\small
 \caption{Reward terms and their weights (\code{rewards.py}). ``Potential'' marks the terms
 that are differences of the potential in \cref{sec:shaping}.}

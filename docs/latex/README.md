@@ -1,12 +1,13 @@
 # AGP design notes — LaTeX sources
 
-Two design documents that formalise the reinforcement-learning setup for the Art Gallery
+Two design documents and a technical report that formalise the reinforcement-learning setup for the Art Gallery
 Problem, plus everything needed to rebuild them.
 
 | File | What it is |
 | --- | --- |
 | `agp_mdp_formulation.tex` / `.pdf` | **Document 1.** The problem written as a Markov Decision Process: what the agent sees, what it can do, how the world changes, and what it gets paid. 17 pages. |
 | `agp_staged_ppo_curriculum.tex` / `.pdf` | **Document 2.** The training plan on top of that MDP: three stages (saturate → prune → refine), the reward-weight schedule, PPO settings, ablations, and an implementation roadmap. 17 pages. |
+| `agp_paper.tex` / `.pdf` | **Technical report.** Explains every current design decision in one place: the geometry behind the two-stage curriculum, the spatial policy network and its factored continuous action, and the MDP and reward with the exact constants from `agp/`. Seven TikZ/pgfplots figures, no external image files. 16 pages. Upload `docs/agp_paper_overleaf.zip` to Overleaf to edit it there. |
 | `agpstyle.sty` | Shared preamble: packages, colours, theorem environments, and all the maths shorthands (`\Free`, `\Vis`, `\ADD`, `\stageI`, …). Edit here, not in the documents. |
 | `refs.bib` | Shared bibliography. ~30 entries: the three locomotion papers, Art Gallery theory, and the RL algorithm literature. |
 | `Makefile` | Build rules. |
@@ -19,7 +20,7 @@ that downloads packages on demand:
 ```sh
 brew install tectonic      # one-off
 cd docs/latex
-make                       # builds both PDFs
+make                       # builds all three PDFs
 make clean                 # remove .aux/.log/.bbl etc., keep the PDFs
 make purge                 # remove the PDFs too
 ```

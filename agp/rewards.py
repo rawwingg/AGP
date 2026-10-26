@@ -39,7 +39,7 @@ class RewardWeights:
 
     # --- parsimony group: use fewer guards --------------------------------
     par: float = 0.0      # guard-count potential: -1 per Add, +1 per Del
-    prune: float = 0.0    # bounded bonus for a deletion that costs no coverage
+    prune: float = 0.0    # redundancy potential: paid on the drop in soft-redundant guard count
     pars: float = 0.0     # terminal bonus per guard saved against the greedy baseline
 
     # --- scaffolding group: learning aids, annealed to zero ---------------
@@ -78,9 +78,10 @@ class RewardWeights:
 class RewardShape:
     """Parameters of the reward's functional forms, as opposed to its weights."""
 
-    # How much lost coverage still counts as "a free deletion". The prune bonus
-    # is exp(-delta_minus / sigma_prune), so 0.005 means half a percent of the
-    # gallery is the scale at which the bonus starts to die off.
+    # How much lost coverage still counts as "a free deletion". Each guard
+    # counts as exp(-delta_minus / sigma_prune) of a redundant guard, so 0.005
+    # means half a percent of the gallery is the scale at which a guard stops
+    # counting as redundant.
     sigma_prune: float = 0.005
 
     # Boundary-inward sweep. The preferred distance-to-wall moves from mu_start
@@ -120,9 +121,11 @@ SATURATE = RewardWeights(
 #
 # Weight sizing: a guard costs par = 0.15, so the whole budget of 16 costs 2.4,
 # comfortably less than the 6-point swing between solving and failing. Parsimony
-# can therefore never make failure look attractive. A free deletion pays
-# par + prune = 0.35, which is large next to the per-step noise, so pruning is
-# worth doing but never worth risking the goal for.
+# can therefore never make failure look attractive. Deleting a fully redundant
+# guard pays par + prune = 0.35, which is large next to the per-step noise, so
+# pruning is worth doing but never worth risking the goal for. Both par and
+# prune are potentials (guard count, soft redundant-guard count), so neither
+# can be farmed by adding guards only to delete them again.
 PRUNE = RewardWeights(
     cov=1.0, goal=4.0, fail=2.0,
     par=0.15, prune=0.20, pars=0.50,
