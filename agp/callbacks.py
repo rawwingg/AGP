@@ -60,7 +60,7 @@ class WeightSchedule(BaseCallback):
 
     def _apply(self, progress: float):
         weights = self.schedule(progress)
-        self.training_env.set_attr("weights", weights)
+        self.training_env.env_method("set_weights", weights)
         # Log the weights that move, so the schedule is visible next to its effect.
         self.logger.record("weights/progress", progress)
         for name in ("par", "prune", "front", "sweep", "sep"):

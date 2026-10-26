@@ -184,8 +184,12 @@ def cmd_train(args):
         "allow_delete": True,
         "presaturate_prob": args.presaturate,
     })
-    env.set_attr("config", stage2_config)
-    env.set_attr("weights", PRUNE)
+    env.env_method("set_config", stage2_config)
+    env.env_method("set_weights", PRUNE)
+    # Read back from the environments themselves: a silent failure here means
+    # "stage 2" trains under stage-1 rules, as happened before set_config existed.
+    if not all(c.allow_delete for c in env.env_method("get_wrapper_attr", "config")):
+        raise RuntimeError("stage-2 config did not reach the environments")
 
     # Unmask Del and Stop. Their logits were never trained in stage 1, so
     # start the mode head at "mostly Add" rather than wherever it was left.

@@ -12,7 +12,8 @@ numbers in the comments refer to that document.
 
 The same class serves both curriculum stages. A stage is nothing more than a
 `RewardWeights` column plus the `allow_delete` flag, both of which the training
-script sets at runtime with `VecEnv.set_attr`.
+script sets at runtime through `set_config` / `set_weights` (called with
+`VecEnv.env_method`, never `VecEnv.set_attr`; see `set_config`).
 """
 
 import math
@@ -117,6 +118,19 @@ class ArtGalleryEnv(gym.Env):
         self.step_count: int = 0
         self.best_coverage: float = 0.0
         self.episode_return: float = 0.0
+
+    # -----------------------------------------------------------------------
+    # Stage switching
+    # -----------------------------------------------------------------------
+    # Call these through `VecEnv.env_method`. `VecEnv.set_attr` sets the
+    # attribute on the outermost wrapper (Monitor), not on this environment,
+    # and `get_attr` then reads the wrapper's copy back -- so the change looks
+    # applied while the environment keeps running the old stage.
+    def set_config(self, config: EnvConfig):
+        self.config = config
+
+    def set_weights(self, weights: RewardWeights):
+        self.weights = weights
 
     # -----------------------------------------------------------------------
     # Reset
