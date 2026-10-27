@@ -14,8 +14,10 @@ k_ref is what the terminal parsimony bonus scores against, and greedy_guards is
 what stage 2 uses as a pre-saturated start state. Computing them here costs a
 few minutes once instead of a few milliseconds every reset.
 
-Train and test are generated from disjoint seeds and written to separate files,
-so the held-out galleries are genuinely unseen geometry rather than a reshuffle.
+Train, validation and test are generated from disjoint seeds and written to
+separate files, so the held-out galleries are genuinely unseen geometry rather
+than a reshuffle. Validation picks the best stage-2 checkpoint; test is only
+ever used for the final score.
 """
 
 import json
@@ -35,6 +37,9 @@ DEFAULT_DIR = Path("data")
 # How many galleries of each difficulty go into each split.
 TRAIN_COUNTS: Dict[str, int] = {"easy": 200, "mid": 200, "hard": 200}
 TEST_COUNTS: Dict[str, int] = {"easy": 30, "mid": 30, "hard": 30}
+VAL_COUNTS: Dict[str, int] = {"easy": 20, "mid": 20, "hard": 20}
+
+SPLITS = ("train", "test", "val")
 
 
 # ---------------------------------------------------------------------------
@@ -88,20 +93,30 @@ def build_split(counts: Dict[str, int],
 def build(out_dir: Path = DEFAULT_DIR,
           train_counts: Optional[Dict[str, int]] = None,
           test_counts: Optional[Dict[str, int]] = None,
+          val_counts: Optional[Dict[str, int]] = None,
           seed: int = 0,
           threshold: float = 0.98,
           max_guards: int = 16,
           img_size: int = 64,
-          workers: Optional[int] = None) -> Dict[str, Path]:
-    """Build both splits and write them to `out_dir`. Returns the paths written."""
+          workers: Optional[int] = None,
+          only: Optional[List[str]] = None) -> Dict[str, Path]:
+    """
+    Build the splits and write them to `out_dir`. Returns the paths written.
+
+    `only` restricts the build to some splits; each split's seed is fixed, so
+    building one leaves the others' contents unchanged.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     written = {}
     splits = [("train", train_counts or TRAIN_COUNTS, seed),
-              ("test", test_counts or TEST_COUNTS, seed + 10_000)]
+              ("test", test_counts or TEST_COUNTS, seed + 10_000),
+              ("val", val_counts or VAL_COUNTS, seed + 20_000)]
 
     for name, counts, split_seed in splits:
+        if only and name not in only:
+            continue
         print(f"[dataset] building {name}: {counts}")
         records = build_split(counts, split_seed, threshold, max_guards, img_size, workers)
         path = out_dir / f"{name}.json"

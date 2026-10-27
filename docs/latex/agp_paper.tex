@@ -720,11 +720,11 @@ continues across the switch.}
 \label{tab:ppo}
 \begin{tabular}{ll@{\hspace{2.5em}}ll}
 \toprule
-learning rate & $3\times10^{-4}$ & discount $\gamma$ & $0.995$ \\
+learning rate & $3\times10^{-4}$ (stage 2: $10^{-4}$) & discount $\gamma$ & $0.995$ \\
 environments & 16 (subprocesses) & GAE $\lambda$ & $0.95$ \\
 rollout length & 256 per env (4096 per update) & clip range & $0.2$ \\
-minibatch & 512 & epochs per update & 10 \\
-entropy coefficient & $0.005$ (stage 2: $0.01$) & value coefficient & $0.5$ \\
+minibatch & 512 & epochs per update & 10 (stage 2: 5) \\
+entropy coefficient & $0.005$ (both stages) & value coefficient & $0.5$ \\
 gradient clip & $0.5$ & target KL & off \\
 steps & $10^6$ per stage & device & Apple MPS \\
 \bottomrule
@@ -732,10 +732,41 @@ steps & $10^6$ per stage & device & Apple MPS \\
 \end{table}
 
 \Cref{tab:ppo} lists the settings. $\gamma = 0.995$ is close to $1$ because episodes are short
-(at most 40 steps) and the terminal bonus must reach the first placement. The entropy
-coefficient is doubled in stage 2 because two of the three modes are new. We do not stop
+(at most 40 steps) and the terminal bonus must reach the first placement. We do not stop
 updates early on a KL threshold: a cap of $0.03$ ended updates after so few gradient steps
-that the placement head barely trained. Training runs on Apple's MPS GPU: a forward and
+that the placement head barely trained.
+
+\paragraph{Smaller steps in stage 2.}
+Stage 2 changes the reward under a policy that already covers every tier. Its job is to
+add $\DEL$ and $\STOP$ on top of that skill, not to relearn placement, so it uses a third of
+stage 1's learning rate and half the epochs per update. At stage 1's step size, single
+updates reached a KL divergence above $1$ late in stage 2, and the placement skill on hard
+galleries degraded within $150$k steps (solved fell from about $95\%$ to $50\%$ in training).
+
+\paragraph{No extra entropy bonus.}
+The bonus acts on the joint entropy of \cref{sec:action}, and that is dominated by the
+cell: up to $\ln 256 \approx 5.5$ nats against $\ln 3 \approx 1.1$ for the mode. Raising it to
+encourage the new modes would mainly flatten the cell distribution, i.e.\ make placement
+less precise, and hard galleries need precise corner guards. Exploration of $\DEL$ and
+$\STOP$ comes from the priming instead, which samples them $20\%$ of the time at the switch.
+
+\paragraph{Model selection.}
+Even with smaller steps, the last stage-2 policy need not be the best one. Every $100$k
+steps we save a checkpoint and score it on a separate validation set (60 galleries, 20 per
+tier, generated from their own seed; \cref{tab:tiers}), running each gallery once with
+deterministic actions. A gallery scores
+\[
+  q = \begin{cases} k_{\mathrm{ref}} / k & \text{if solved,}\\ 0 & \text{otherwise,}\end{cases}
+\]
+so $q = 1$ matches greedy and $q > 1$ beats it; the checkpoint's score is the mean of $q$, and
+the highest-scoring checkpoint is the result. The starting policy is scored too, so the kept
+model is never worse on validation than where stage 2 began. One number is needed because
+ranking by solved rate first fails: a policy that never stops fills the 16-guard budget,
+covers everything, and would outrank one that solves slightly fewer galleries with a third
+of the guards. The test set is used once, for the final numbers in \cref{tab:results}.
+
+\paragraph{Hardware.}
+Training runs on Apple's MPS GPU: a forward and
 backward pass over 512 samples takes $12$\,ms there versus $600$\,ms on the CPU. Beta sampling,
 the one operation MPS lacks, is done on the CPU for the single offset drawn per environment
 per step. $G=16$ is a compromise: $256$ regions separate distinct pockets while keeping the
@@ -745,14 +776,15 @@ changing what positions are reachable.
 \subsection{Results}\label{sec:results}
 
 \takeaway{%
-\textbf{Results pending.} The two-stage run with the spatial policy
-(\code{runs/agp\_v2}) was in progress when this report was written. \Cref{tab:results}
-is a placeholder to be filled from the final held-out evaluation (deterministic actions,
-90 test galleries).}
+\textbf{Results pending.} Stage 2 with the spatial policy (\code{runs/agp\_v3}, continuing
+from the stage-1 checkpoint of \code{runs/agp\_v2}) was in progress when this report was
+written. \Cref{tab:results} is a placeholder to be filled from the test-set evaluation of
+the best-on-validation checkpoint (deterministic actions, 90 test galleries).}
 
 \begin{table}[!htbp]
 \centering\small
-\caption{Held-out evaluation of the spatial policy. \pending{: fill from \code{runs/train\_v2.log}}}
+\caption{Test-set evaluation of the spatial policy (best stage-2 checkpoint on validation).
+\pending{: fill from \code{runs/train\_v3.log}}}
 \label{tab:results}
 \begin{tabular}{lcccc}
 \toprule
@@ -803,7 +835,8 @@ generator (\code{polygons.py}) produces three tiers (\cref{tab:tiers}).
 
 \begin{table}[!htbp]
 \centering\small
-\caption{Difficulty tiers. 200 training and 30 test galleries per tier.}
+\caption{Difficulty tiers. 200 training, 20 validation and 30 test galleries per tier, each
+split from its own seed.}
 \label{tab:tiers}
 \begin{tabular}{lccc}
 \toprule

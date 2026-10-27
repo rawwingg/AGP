@@ -15,6 +15,8 @@ inherits everything stage 1 learned.
     Stage 2  PRUNE     Del and Stop unmasked, guards start costing. 40% of
                        episodes begin from the greedy cover, which is dense in
                        redundant guards and therefore in useful deletions.
+                       Smaller PPO updates than stage 1; checkpoints are scored
+                       on data/val.json and the best one is kept.
 """
 
 import argparse
@@ -32,7 +34,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 
 from . import dataset as dataset_module
-from .callbacks import EpisodeMetrics, TrainingViewer, WeightSchedule
+from .callbacks import BestCheckpoint, EpisodeMetrics, TrainingViewer, WeightSchedule
 from .env import ArtGalleryEnv, EnvConfig
 from .policy import SpatialPolicy, SpatialTrunk, prime_mode_head
 from .rewards import PRUNE, RewardShape, SATURATE, prune_weights, saturate_weights
@@ -87,6 +89,7 @@ def cmd_dataset(args):
         threshold=args.threshold,
         max_guards=args.max_guards,
         workers=args.workers,
+        only=args.only,
     )
 
 
@@ -97,10 +100,12 @@ def cmd_train(args):
     data_dir = Path(args.data_dir)
     train_records = dataset_module.load(data_dir / "train.json")
     test_records = dataset_module.load(data_dir / "test.json")
+    val_records = dataset_module.load(data_dir / "val.json")
 
     run_dir = Path(args.run_dir) / args.name
     run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[train] {len(train_records)} train / {len(test_records)} test galleries")
+    print(f"[train] {len(train_records)} train / {len(val_records)} val / "
+          f"{len(test_records)} test galleries")
     print(f"[train] run directory: {run_dir}")
 
     # --- stage 1 environment: add-only, empty start ------------------------
@@ -193,13 +198,23 @@ def cmd_train(args):
 
     # Unmask Del and Stop. Their logits were never trained in stage 1, so
     # start the mode head at "mostly Add" rather than wherever it was left.
+    # The priming alone gives Del and Stop enough samples to be learned.
     prime_mode_head(model.policy, add_prob=args.add_prob)
 
-    # Two thirds of the action space has never been exercised, so temporarily
-    # raise the entropy bonus to stop the policy collapsing onto Add out of habit.
-    model.ent_coef = args.ent_coef * 2.0
+    # Smaller updates than stage 1. Stage 2 changes the reward under a policy
+    # that already covers well; with stage 1's step size, updates reached a KL
+    # above 1 and wiped out the placement skill on hard galleries. The entropy
+    # bonus is not raised either: most of the policy's entropy is the choice of
+    # cell, so a larger bonus mainly blurs where guards go.
+    model.learning_rate = args.stage2_lr
+    model._setup_lr_schedule()          # rebuild the schedule from learning_rate
+    model.n_epochs = args.stage2_epochs
+    model.ent_coef = args.ent_coef
 
-    print(f"\n[train] === stage 2: prune ({args.stage2_steps:,} steps) ===")
+    print(f"\n[train] === stage 2: prune ({args.stage2_steps:,} steps, "
+          f"lr {args.stage2_lr:g}, {args.stage2_epochs} epochs) ===")
+    best = BestCheckpoint(val_records, stage2_config, PRUNE, run_dir, "stage2",
+                          every=args.checkpoint_every)
     model.learn(
         total_timesteps=args.stage2_steps,
         reset_num_timesteps=False,      # one continuous run, two phases
@@ -210,17 +225,23 @@ def cmd_train(args):
                                                      "augment": False,
                                                      "presaturate_prob": 0.0}),
                            every=args.viewer_every),
+            best,
         ],
         tb_log_name="stage2_prune",
         progress_bar=args.progress,
     )
     model.save(run_dir / "stage2_prune")
-    print(f"[train] saved {run_dir / 'stage2_prune.zip'}")
+    print(f"[train] saved {run_dir / 'stage2_prune.zip'} (final) and "
+          f"{best.best_path}.zip (best on validation)")
 
     env.close()
 
     # --- final score against the baseline ---------------------------------
-    evaluate(model, test_records, stage2_config)
+    # The best-on-validation model is the result; the final one is shown for
+    # comparison, since the gap between them says how stable stage 2 was.
+    evaluate(model, test_records, stage2_config, label="final")
+    evaluate(PPO.load(best.best_path, device=args.device), test_records, stage2_config,
+             label="best on validation")
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +260,7 @@ def cmd_eval(args):
     evaluate(model, records, config)
 
 
-def evaluate(model, records, config: EnvConfig):
+def evaluate(model, records, config: EnvConfig, label: str = ""):
     """
     Score the policy on held-out galleries, next to the greedy baseline.
 
@@ -263,7 +284,7 @@ def evaluate(model, records, config: EnvConfig):
             "return": total,
         })
 
-    print("\n[eval] held-out results")
+    print(f"\n[eval] held-out results{f' ({label})' if label else ''}")
     print(f"       {'tier':>6}  {'n':>4}  {'solved':>7}  {'coverage':>9}  "
           f"{'k':>6}  {'k_ref':>6}  {'k/k_ref':>8}")
 
@@ -325,6 +346,8 @@ def build_parser():
     p.add_argument("--workers", type=int, default=None, help="parallel processes (default: all cores)")
     p.add_argument("--train-per-tier", type=int, default=None, help="override the train split size")
     p.add_argument("--test-per-tier", type=int, default=None, help="override the test split size")
+    p.add_argument("--only", nargs="+", choices=dataset_module.SPLITS, default=None,
+                   help="build only these splits (e.g. --only val)")
     p.set_defaults(func=cmd_dataset)
 
     # --- train ---
@@ -339,6 +362,12 @@ def build_parser():
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--ent-coef", type=float, default=0.005)
+    p.add_argument("--stage2-lr", type=float, default=1e-4,
+                   help="stage-2 learning rate (smaller than stage 1's to keep its placement skill)")
+    p.add_argument("--stage2-epochs", type=int, default=5,
+                   help="stage-2 PPO epochs per update")
+    p.add_argument("--checkpoint-every", type=int, default=100_000,
+                   help="stage-2 steps between saved checkpoints and validation scores")
     p.add_argument("--grid", type=int, default=16,
                    help="cells per side of the placement grid (positions stay continuous)")
     p.add_argument("--target-kl", type=float, default=0.0,

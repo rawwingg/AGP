@@ -2,7 +2,7 @@
 Stable-Baselines3 callbacks: the weight schedule, episode metrics, and the
 training viewer.
 
-Three concerns, three callbacks, deliberately kept separate:
+Four concerns, four callbacks, deliberately kept separate:
 
   WeightSchedule  moves the reward weights through the stage's schedule.
   EpisodeMetrics  turns the environment's end-of-episode info into TensorBoard
@@ -11,9 +11,12 @@ Three concerns, three callbacks, deliberately kept separate:
   TrainingViewer  renders a row of finished episodes into TensorBoard every few
                   thousand steps. Return curves say whether learning is
                   happening; the pictures say what it has actually learned.
+  BestCheckpoint  saves the model periodically and keeps the one that scores
+                  best on the validation galleries.
 """
 
 from collections import deque
+from pathlib import Path
 from typing import Callable, List
 
 import numpy as np
@@ -144,3 +147,78 @@ class TrainingViewer(BaseCallback):
         self.logger.record("viewer/rollouts", Figure(figure, close=True),
                            exclude=("stdout", "log", "json", "csv"))
         return True
+
+
+# ---------------------------------------------------------------------------
+# Periodic checkpoints with best-model selection
+# ---------------------------------------------------------------------------
+class BestCheckpoint(BaseCallback):
+    """
+    Every `every` steps, save the model and score it on the validation galleries.
+
+    PPO can lose a good policy to a few oversized updates, and the last
+    checkpoint is then worse than ones before it. Each gallery scores
+    k_ref / k if solved and 0 if not (1 = matches greedy, above 1 beats it), and
+    the checkpoint's score is the mean. Ranking by solved rate first would not
+    do: a policy that never stops fills the budget, "solves" everything, and
+    would beat one that solves slightly fewer with a third of the guards.
+    """
+
+    def __init__(self, records: List[dict], config: EnvConfig, weights: RewardWeights,
+                 save_dir: Path, prefix: str, every: int = 100_000, verbose: int = 0):
+        super().__init__(verbose)
+        self.records = records
+        self.config = EnvConfig(**{**config.__dict__, "augment": False, "presaturate_prob": 0.0})
+        self.weights = weights
+        self.save_dir = Path(save_dir)
+        self.prefix = prefix
+        self.every = every
+        self.best = None
+        self.best_path = self.save_dir / f"{prefix}_best"
+        self._next = 0
+        self._last = None
+
+    def _on_training_start(self):
+        # Score the starting policy too, so the kept model is never worse on
+        # validation than the one the stage began with.
+        self._checkpoint()
+        self._next = self.num_timesteps + self.every
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps >= self._next:
+            self._next = self.num_timesteps + self.every
+            self._checkpoint()
+        return True
+
+    def _on_training_end(self):
+        if self.num_timesteps != self._last:
+            self._checkpoint()
+
+    def _checkpoint(self):
+        from .viewer import rollout    # deferred, as in TrainingViewer
+
+        self._last = self.num_timesteps
+        solved, ratios, scores = [], [], []
+        for record in self.records:
+            gallery, _, info = rollout(self.model, record, self.config, self.weights)
+            solved.append(info.get("solved", 0.0))
+            if solved[-1] >= 1.0:
+                ratios.append(gallery.n_guards / record["k_ref"])
+                scores.append(record["k_ref"] / gallery.n_guards)
+            else:
+                scores.append(0.0)
+        solved_rate = float(np.mean(solved))
+        ratio = float(np.mean(ratios)) if ratios else float("inf")
+        score = float(np.mean(scores))
+
+        self.model.save(self.save_dir / "checkpoints" / f"{self.prefix}_{self.num_timesteps}")
+        self.logger.record("val/solved", solved_rate)
+        self.logger.record("val/guard_ratio", ratio)
+        self.logger.record("val/score", score)
+
+        improved = self.best is None or score > self.best
+        if improved:
+            self.best = score
+            self.model.save(self.best_path)
+        print(f"[val] {self.num_timesteps:,} steps: score {score:.3f}, solved {solved_rate:.1%}, "
+              f"guards/greedy {ratio:.3f}{'  <- best' if improved else ''}")
