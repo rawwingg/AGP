@@ -20,7 +20,6 @@
 \date{\today}
 
 % A visible marker for numbers that do not exist yet.
-\newcommand{\pending}[1]{\textcolor{agpaccent}{\textbf{[pending#1]}}}
 
 % One colour scheme for every figure.
 \colorlet{seen}{agpblue!22}
@@ -49,9 +48,11 @@ guard's redundancy can only be measured \emph{after} the gallery is saturated, a
 dense rewards we use are potential-based, so they telescope into the true objective.
 \Cref{sec:arch} describes the policy network and why each part of it exists: it keeps the
 map's spatial layout to the output and factors each placement into a choice of region and a
-\emph{continuous} point inside it. \Cref{sec:mdp} states the MDP and the reward with the exact
-constants used in code. \Cref{sec:stage3} outlines an optional third stage with a relocation
-action.
+\emph{continuous} point inside it, and it masks the three moves that are never right ($\STOP$
+or $\DEL$ below the coverage threshold, $\STOP$ while a guard can still go).
+\Cref{sec:mdp} states the MDP and the reward with the exact constants used in code.
+\Cref{sec:next} lists the settings that were chosen rather than tuned and how to test them,
+and how to decide whether a relocation action is needed.
 \end{abstract}
 
 \tableofcontents
@@ -68,8 +69,8 @@ two stages on one network (\cref{fig:curriculum}):
   \item[\stageI{} (stage 1).] Only $\ADD$ is allowed and guards are free. The agent learns
         to cover arbitrary galleries.
   \item[\stageII{} (stage 2).] $\DEL$ and $\STOP$ are unmasked, every guard costs reward,
-        and deleting a guard that costs no coverage is paid. The agent learns to remove the
-        guards it does not need.
+        and deleting a \emph{free} guard, one whose loss keeps the gallery covered, is paid.
+        The agent learns to place fewer guards and to remove the ones it does not need.
 \end{description}
 
 Three facts shape everything below. The problem is NP-hard, so a learned heuristic is a
@@ -155,9 +156,10 @@ Every quantity that enters the \emph{reward} is computed exactly with Shapely po
 $f(S)$, the area a new guard adds, and the area lost when a guard is removed. The
 \emph{observation} is a $64\times 64$ raster of the gallery's bounding box: pixel $(r,c)$
 samples the point $(x_{\min} + c\,w/63,\; y_{\min} + r\,h/63)$, where $w, h$ are the box's
-width and height. The raster is also used for one cheap estimate shown to the agent, the
-per-guard exclusive area (\cref{sec:obs}). Exact rewards mean the agent is never paid for
-raster artefacts; a raster observation means the network can be convolutional.
+width and height. The raster also gives a cheap estimate of each guard's exclusive area
+(\cref{sec:obs}), used to screen which guards need an exact check. Exact rewards mean the
+agent is never paid for raster artefacts; a raster observation means the network can be
+convolutional.
 
 \subsection{Complexity, and what a learned policy can gain}\label{sec:complexity}
 
@@ -173,8 +175,13 @@ This tells us where a learned policy can do better than classical heuristics:
   \item \textbf{Continuous positions.} Optimal point guards need not lie on any candidate
         set. A policy that outputs real coordinates can reach positions no candidate-based
         method can. We keep the action continuous for this reason (\cref{sec:action}).
-  \item \textbf{Pruning.} Greedy covers are not minimal, so removing redundant guards
-        recovers slack that greedy leaves behind (\cref{sec:greedy}).
+  \item \textbf{Placement.} Greedy never revisits a choice, so a guard placed early for its
+        large gain can force awkward extra guards later. A policy that learns where to place
+        can use fewer guards from the start.
+  \item \textbf{Pruning.} Guards that became free as later guards overlapped them can be
+        removed. In practice this matters less than placement: greedy's own prune step
+        removes a guard in only $59$ of $600$ training galleries, and the learned policy's
+        solutions have similarly few free guards (\cref{sec:results}).
 \end{enumerate}
 
 \subsection{Submodularity: why pruning must come second}\label{sec:submod}
@@ -333,12 +340,15 @@ reward paid per \emph{event} can be farmed by repeating the event. We avoid both
 every dense term as the change of a function of the state. Let $u(s) = 1 - f(S)$,
 $k(s)=\lvert S\rvert$, and let
 \[
-  R(s) \;=\; \sum_{g_j \in S} \exp\!\bigl(-\hat\delta^-_j/\sigma_p\bigr), \qquad \sigma_p = 0.005,
+  R(s) \;=\; \bigl\lvert\{\, g_j \in S \;:\; f(S) - \delta^-(g_j\mid S) \ge c^\dagger \,\}\bigr\rvert
 \]
-be a soft count of redundant guards: a guard that sees nothing on its own counts as $1$, one
-that alone covers well over half a percent of the gallery counts as about $0$. Here
-$\hat\delta^-_j$ is the raster estimate of the exclusive area, the same quantity the agent
-sees in observation channel 4. Define
+be the number of \emph{free} guards: those that could each be deleted on their own with the
+gallery still solved. ``Free'' is the success rule itself, so a guard alone covering $1.2\%$ of
+a gallery at $99.5\%$ coverage is free, while one covering $0.1\%$ of a gallery at $98.05\%$ is
+not. An earlier version counted a guard as redundant only if it alone covered well under half
+a percent of the gallery, $R=\sum_j\exp(-\hat\delta^-_j/0.005)$. Under that rule only 2 of
+the 10 guards that run v7's test solutions could spare (\cref{tab:runs}) counted as clearly redundant (weight above
+$0.75$), 2 more were refused by the old ratchet, and v7 learned never to delete. Define
 \[
   \Pot(s) \;=\; -w_{\mathrm{cov}}\,u(s) \;-\; w_{\mathrm{par}}\,k(s) \;-\; w_{\mathrm{prune}}\,R(s),
   \qquad
@@ -354,11 +364,11 @@ every step. Along any episode,
 \]
 where the constant depends only on the start state ($0$ from an empty gallery). The dense
 reward therefore depends only on \emph{where the episode ends}, not on the path to it:
-coverage reached, guards used, and how many of them are redundant. No sequence of actions
+coverage reached, guards used, and how many of them are free. No sequence of actions
 can collect more than that endpoint is worth, so no dense term can be farmed. The potentials
 are differenced with $\gamma=1$ and the terminal state is not zeroed, so the endpoint value is
 part of the return rather than cancelled; it is exactly the objective of \cref{sec:collapse}
-(cover, with few guards, none of them redundant). The identity is exact for
+(cover, with few guards, none of them free). The identity is exact for
 the undiscounted return. PPO discounts with $\gamma=0.995$, and episodes are at most 40
 steps long, so later terms are weighted by at least $0.995^{40}\approx0.82$: the shaping is
 close to, though not exactly, the discounted form $\gamma\Pot(s')-\Pot(s)$ whose policy
@@ -414,8 +424,9 @@ and then fall linearly to $0$, so the last $30\%$ trains on the unbiased reward
 (\cref{rule:anneal}). Stage 2 blends from that column to the parsimony weights (orange) over
 its first $5\%$, which spares the value function a step change. Not plotted because of scale:
 the potential term $w_{\mathrm{cov}}=1$ and the terminal $w_{\mathrm{goal}}=4$,
-$w_{\mathrm{fail}}=2$ are constant; $w_{\mathrm{pars}}$ ($0\to0.5$), $w_{\mathrm{stop}}$
-($0\to2$) and $w_{\mathrm{void}}$ ($0\to0.1$) blend in with $w_{\mathrm{par}}$.}
+$w_{\mathrm{goal,min}}=1$, $w_{\mathrm{fail}}=2$ are constant; $w_{\mathrm{pars}}$ ($0\to0.5$),
+$w_{\mathrm{stop}}$ ($0\to2$) and $w_{\mathrm{void}}$ ($0\to0.5$) blend in with
+$w_{\mathrm{par}}$.}
 \label{fig:curriculum}
 \end{figure}
 
@@ -441,7 +452,8 @@ into five concrete requirements, and each part of the network answers one of the
         thin wedge behind a hole or a reflex corner (\cref{fig:visibility}), a few pixels
         wide. The network must not blur it away before deciding where to aim.
   \item[R5 Unordered modes with masking.] $\ADD$, $\DEL$ and $\STOP$ are unordered
-        alternatives, and stage 1 must disable two of them cleanly.
+        alternatives. Stage 1 must disable two of them cleanly, and stage 2 must disable
+        each one in the states where it is never right.
 \end{description}
 
 \subsection{The network}
@@ -528,10 +540,11 @@ gallery and penalised.
 \paragraph{Heads and initialisation.}
 The cell head outputs five maps: a score $s_k$ per cell and four Beta parameters, made
 $\ge 1$ by $1+\operatorname{softplus}(\cdot)$ so that every offset density is unimodal and
-bounded. The mode and value heads read $z$, because ``stop now'' and ``how good is this
+bounded. In stage 2 a second $1{\times}1$ layer on the same hidden map gives $\DEL$ its own
+five maps (\cref{sec:action}). The mode and value heads read $z$, because ``stop now'' and ``how good is this
 state'' are global questions. The last layers of the cell and mode heads are initialised
 orthogonally with gain $0.01$, so training starts from near-uniform cells, near-uniform modes
-and gently centred offsets.
+and gently centred offsets; $\DEL$'s layer is initialised the same way when stage 2 adds it.
 
 \subsection{The factored action}\label{sec:action}
 
@@ -539,15 +552,27 @@ Index cells by $k = rG + c$ with row $r$ along $y$ and column $c$ along $x$. The
 samples
 \[
   \mu \sim \mathrm{Cat}(\pi^{\mathrm{mode}}), \qquad
-  k \sim \mathrm{Cat}(\pi^{\mathrm{cell}}), \qquad
-  o_x \sim \mathrm{Beta}(a^x_k,b^x_k), \quad o_y \sim \mathrm{Beta}(a^y_k,b^y_k),
+  k \sim \mathrm{Cat}(\pi^{\mathrm{cell}}_\mu), \qquad
+  o_x \sim \mathrm{Beta}(a^x_{\mu,k},b^x_{\mu,k}), \quad o_y \sim \mathrm{Beta}(a^y_{\mu,k},b^y_{\mu,k}),
 \]
 \[
   (x,y) \;=\; \Bigl(\frac{c + o_x}{G},\; \frac{r + o_y}{G}\Bigr),
   \qquad
-  \pi^{\mathrm{cell}}_k \propto \exp(s_k)\,\Ind{\text{cell $k$ is live}},
+  \pi^{\mathrm{cell}}_{\mu,k} \propto \exp(s_{\mu,k})\,\Ind{\text{cell $k$ is live for $\mu$}},
 \]
-and sends the vector $[\mu, x, y]$ to the environment (\cref{fig:action}).
+and sends the vector $[\mu, x, y]$ to the environment (\cref{fig:action}). $\ADD$ and $\DEL$
+each have their own maps; $\STOP$ ignores the point and uses $\ADD$'s. A cell is live for
+$\ADD$ if it holds gallery interior, and for $\DEL$ if it also holds a guard: $\DEL$ removes the
+guard nearest its point, so no target is lost.
+
+\paragraph{Why $\DEL$ has its own map.} Up to v10 one map served every mode, and the mode and
+the cell were drawn independently, so where the policy pointed could not depend on what it was
+about to do. $\ADD$ is about two thirds of all actions and learns to point at uncovered space;
+the guards worth deleting sit where coverage overlaps. A $\DEL$ therefore pointed roughly where
+an $\ADD$ would go: on hard galleries most were refused, a median quarter to a third of the
+diagonal away from any free guard (\cref{sec:results}). Stage 1 never deletes and has only
+$\ADD$'s map; stage 2 adds $\DEL$'s, starting near-uniform over the guards' cells rather than
+as a copy of $\ADD$'s.
 
 \begin{figure}[!htbp]
 \centering
@@ -676,7 +701,7 @@ probability is clipped at the cell edges, which avoids the boundary bias of clip
 Given a stored action $[\mu,x,y]$, the code recovers $k$, $o_x$, $o_y$ and computes
 \[
   \log\pi(a\mid s) \;=\; \log\pi^{\mathrm{mode}}_\mu
-  \;+\; \Ind{\mu\neq\STOP}\Bigl(\log\pi^{\mathrm{cell}}_k + \log\mathrm{Beta}(o_x) + \log\mathrm{Beta}(o_y)\Bigr).
+  \;+\; \Ind{\mu\neq\STOP}\Bigl(\log\pi^{\mathrm{cell}}_{\mu,k} + \log\mathrm{Beta}_{\mu,k}(o_x) + \log\mathrm{Beta}_{\mu,k}(o_y)\Bigr).
 \]
 The constant $\log G^2$ is dropped because it cancels in PPO's probability ratio. The point
 term is excluded for $\STOP$ because a $\STOP$ ignores the point, so including it would only add
@@ -684,11 +709,17 @@ gradient noise to a decision that does not depend on it. Offsets are clamped to
 $[10^{-5}, 1-10^{-5}]$, which keeps sampled points strictly inside their cell and the Beta
 log-densities finite. The entropy bonus is that of the joint choice,
 \[
-  \mathcal{H} \;=\; \mathcal{H}(\pi^{\mathrm{mode}}) + \mathcal{H}(\pi^{\mathrm{cell}})
-  + \textstyle\sum_k \pi^{\mathrm{cell}}_k\bigl(\mathcal{H}(\mathrm{Beta}^x_k) + \mathcal{H}(\mathrm{Beta}^y_k)\bigr).
+  \mathcal{H} \;=\; \mathcal{H}(\pi^{\mathrm{mode}}) + \textstyle\sum_{\mu\in\{\ADD,\DEL\}} \pi^{\mathrm{mode}}_\mu\,\mathcal{H}_\mu,
 \]
+\[
+  \mathcal{H}_\mu = \mathcal{H}(\pi^{\mathrm{cell}}_\mu)
+  + \textstyle\sum_k \pi^{\mathrm{cell}}_{\mu,k}\bigl(\mathcal{H}(\mathrm{Beta}^x_{\mu,k}) + \mathcal{H}(\mathrm{Beta}^y_{\mu,k})\bigr),
+\]
+with the weights $\pi^{\mathrm{mode}}_\mu$ held constant in the gradient, so the bonus cannot
+push the mode towards whichever map is more spread out ($\ADD$'s covers the gallery, $\DEL$'s
+only the guards). In stage 1 $\pi^{\mathrm{mode}}_{\ADD}=1$ and this is the true joint entropy.
 The deterministic action used for evaluation is the most probable mode, the most probable
-cell, and the Beta means $a/(a+b)$ inside it.
+cell of that mode's map, and the Beta means $a/(a+b)$ inside it.
 
 \subsection{The mode head across the stage switch (R5)}
 
@@ -707,11 +738,43 @@ policy.
 Masked logits receive no gradient, so at the switch the mode head is still at its
 initialisation and would choose among the three modes arbitrarily. Instead, we zero the mode
 head's weights and set its biases so that $\pi^{\mathrm{mode}} = (0.8, 0.1, 0.1)$ in every state
-(\code{--add-prob 0.8}). Stage 2 therefore starts by behaving as stage 1 ended, mostly
-adding, while sampling $\DEL$ and $\STOP$ often enough to learn their value. The placement
-heads are left as stage 1 trained them.
+(\code{-{}-add-prob 0.8}). Stage 2 therefore starts by behaving as stage 1 ended, mostly
+adding, while sampling $\DEL$ and $\STOP$ from the first update. The placement heads are left
+as stage 1 trained them. Priming only sets the starting point; keeping $\DEL$ explored
+afterwards is the job of the mode's own entropy bonus (\cref{sec:ppo}).
 
-\subsection{PPO configuration}
+\paragraph{Stage 2: three masks on moves that are never right.}
+Some mode choices are wrong in every state of a given kind, and the observation already says
+which states those are. Learning that from reward costs samples and, as the development runs
+showed (\cref{tab:runs}), sometimes fails outright. The policy therefore masks them at the
+logits, as in stage 1, reading the two scalars that decide them (\cref{tab:obs}):
+\begin{description}[leftmargin=1.6em]
+  \item[$\STOP$ below $c^\dagger$] (\code{stop\_below}). Stopping short is never the better
+        answer. Left to learn it, a policy kept stopping at $96$--$98\%$ on hard galleries.
+  \item[$\STOP$ while a guard is free] (\code{stop\_while\_free}). Guards cost reward, so a
+        free guard left at the end is always worse than deleting it. Left to learn it, v7 stopped
+        with every spare guard still in place.
+  \item[$\DEL$ below $c^\dagger$] (\code{delete\_below}). Below the threshold a deletion can only
+        lose more coverage, and deleting a guard to re-add it elsewhere nets nothing, so $\ADD$ is
+        the only useful move. Left to learn it, v8 kept choosing $\DEL$ at $97\%$ until two refusals
+        ended the episode uncovered.
+\end{description}
+None of these takes a choice away from a state where it could help. A $\DEL$ made at or
+above $c^\dagger$ may still dip coverage below it; the masks then leave $\ADD$ as the only
+move, which forces the repair. $\ADD$ is never masked, so at least one mode is always available.
+
+\paragraph{Stage 2: $\ADD$ kept out of cells known to add nothing.} A fourth mask acts on
+$\ADD$'s cell map rather than on the mode (\code{skip\_redundant\_cells}). A guard that sees
+nothing any other guard does not see (raster $\hat\delta^-_j = 0$) is drawn at $255$ in
+channel 4 at any coverage, and $\ADD$ may not choose its cell. An $\ADD$ that gains nothing
+leaves the observation almost unchanged, so a deterministic policy repeats it: v11 stacked
+eleven guards on one spot of a hard gallery at $97.6\%$ until the budget ended the episode
+(\cref{sec:results}). After one such $\ADD$ the new guard and the one it duplicates both have
+$\hat\delta^-_j = 0$, and the cell closes. Unlike the mode masks this one is a heuristic: a
+different point of the same cell could still see something new, and a point aimed into a hole
+is projected into the gallery, possibly into a cell the mask does not cover.
+
+\subsection{PPO configuration}\label{sec:ppo}
 
 \begin{table}[!htbp]
 \centering\small
@@ -724,7 +787,7 @@ learning rate & $3\times10^{-4}$ (stage 2: $10^{-4}$) & discount $\gamma$ & $0.9
 environments & 16 (subprocesses) & GAE $\lambda$ & $0.95$ \\
 rollout length & 256 per env (4096 per update) & clip range & $0.2$ \\
 minibatch & 512 & epochs per update & 10 (stage 2: 5) \\
-entropy coefficient & $0.005$ (both stages) & value coefficient & $0.5$ \\
+entropy coefficient & $0.005$ (stage-2 mode: $0.03$) & value coefficient & $0.5$ \\
 gradient clip & $0.5$ & target KL & off \\
 steps & $10^6$ per stage & device & Apple MPS \\
 \bottomrule
@@ -743,12 +806,21 @@ stage 1's learning rate and half the epochs per update. At stage 1's step size, 
 updates reached a KL divergence above $1$ late in stage 2, and the placement skill on hard
 galleries degraded within $150$k steps (solved fell from about $95\%$ to $50\%$ in training).
 
-\paragraph{No extra entropy bonus.}
+\paragraph{Separate entropy bonuses for the mode and for placement.}
 The bonus acts on the joint entropy of \cref{sec:action}, and that is dominated by the
-cell: up to $\ln 256 \approx 5.5$ nats against $\ln 3 \approx 1.1$ for the mode. Raising it to
-encourage the new modes would mainly flatten the cell distribution, i.e.\ make placement
-less precise, and hard galleries need precise corner guards. Exploration of $\DEL$ and
-$\STOP$ comes from the priming instead, which samples them $20\%$ of the time at the switch.
+cell: up to $\ln 256 \approx 5.5$ nats against $\ln 3 \approx 1.1$ for the mode. One coefficient
+cannot serve both. Sized for placement ($0.005$), it barely acts on the mode: priming
+starts $\DEL$ at $10\%$, but a correct deletion earns only about $+0.35$ while a mis-aimed one
+is refused or costs coverage, and under a noisy critic the mode head converged on stopping
+at once, keeping every redundant guard. Raised enough to keep $\DEL$ in play, it mainly
+flattens the cell distribution, making placement less precise where hard galleries need
+precise corner guards. Stage 2 therefore weights the mode term separately,
+\[
+  \mathcal{H}_w = 6\,\mathcal{H}(\pi^{\mathrm{mode}}) + \textstyle\sum_{\mu\in\{\ADD,\DEL\}} \pi^{\mathrm{mode}}_\mu\,\mathcal{H}_\mu,
+\]
+so with coefficient $0.005$ the mode receives an effective bonus of $0.03$ and placement
+keeps $0.005$. The share of $\ADD$, $\DEL$ and $\STOP$ among actions is logged per rollout,
+so a mode head that abandons $\DEL$ is visible long before the guard counts show it.
 
 \paragraph{Model selection.}
 Even with smaller steps, the last stage-2 policy need not be the best one. Every $100$k
@@ -763,7 +835,8 @@ the highest-scoring checkpoint is the result. The starting policy is scored too,
 model is never worse on validation than where stage 2 began. One number is needed because
 ranking by solved rate first fails: a policy that never stops fills the 16-guard budget,
 covers everything, and would outrank one that solves slightly fewer galleries with a third
-of the guards. The test set is used once, for the final numbers in \cref{tab:results}.
+of the guards. No checkpoint is chosen by its test score, though the test set was also used
+to diagnose the development runs (\cref{sec:results}).
 
 \paragraph{Hardware.}
 Training runs on Apple's MPS GPU: a forward and
@@ -776,26 +849,149 @@ changing what positions are reachable.
 \subsection{Results}\label{sec:results}
 
 \takeaway{%
-\textbf{Results pending.} Stage 2 with the spatial policy (\code{runs/agp\_v3}, continuing
-from the stage-1 checkpoint of \code{runs/agp\_v2}) was in progress when this report was
-written. \Cref{tab:results} is a placeholder to be filled from the test-set evaluation of
-the best-on-validation checkpoint (deterministic actions, 90 test galleries).}
+\textbf{Stage 2 cuts guards by about $12\%$ and leaves no free guard.} The current
+implementation, trained as run v11 (\code{runs/agp\_v11}, stage 2 continuing from the
+stage-1 checkpoint of \code{runs/agp\_v2}), solves 89 of the 90 test galleries at $1.191$
+times the greedy guard count, against $1.347$ for stage 1 and $1.196$ for v7, the best earlier
+run. None of its solutions holds a guard that could be deleted, and from a pre-filled start it
+removes $4.0$, $4.0$ and $3.6$ of the four spares on easy, mid and hard galleries. The one
+failure is a deterministic loop: on a hard gallery it adds guards at the same spot until the
+budget runs out.}
+
+\Cref{tab:results} gives the standard evaluation (\code{agp.train eval}: deterministic
+actions, 90 test galleries, starting from zero guards) for stage 1, for v7, the stage-2 run
+with the lowest guard count before v11, for v10, and for v11, the current implementation. v7 ran under an earlier rule set: no free-guard rule, no $\STOP$ mask for
+free guards and no $\DEL$ mask (\cref{tab:runs}). Stage 1 is scored with v9's
+observation code; its training saw the older channel 4, which the add-only policy barely uses.
 
 \begin{table}[!htbp]
 \centering\small
-\caption{Test-set evaluation of the spatial policy (best stage-2 checkpoint on validation).
-\pending{: fill from \code{runs/train\_v3.log}}}
+\caption{Test-set evaluation from zero guards, deterministic actions. $k/k_{\mathrm{ref}}$ is
+mean $k$ over mean $k_{\mathrm{ref}}$ on the solved galleries, as \code{agp.train eval} prints it.}
 \label{tab:results}
-\begin{tabular}{lcccc}
+\begin{tabular}{llcccc}
 \toprule
-tier & solved & mean coverage & mean $k$ (solved) & $k/k_{\mathrm{ref}}$ (solved) \\
+model & tier & solved & mean coverage & mean $k$ (solved) & $k/k_{\mathrm{ref}}$ (solved) \\
 \midrule
-easy & \pending{} & \pending{} & \pending{} & \pending{} \\
-mid  & \pending{} & \pending{} & \pending{} & \pending{} \\
-hard & \pending{} & \pending{} & \pending{} & \pending{} \\
+stage 1 (\code{agp\_v2})     & easy & 100\% & 0.996 & 2.63 & 1.362 \\
+                             & mid  & 100\% & 0.994 & 3.77 & 1.413 \\
+                             & hard & 100\% & 0.988 & 7.83 & 1.313 \\
+                             & all  & 100\% & 0.993 & 4.74 & 1.347 \\
+\midrule
+stage 2, v7                  & easy & 100\% & 0.996 & 2.27 & 1.172 \\
+                             & mid  & 100\% & 0.991 & 3.17 & 1.188 \\
+                             & hard & 100\% & 0.988 & 7.20 & 1.207 \\
+                             & all  & 100\% & 0.991 & 4.21 & 1.196 \\
+\midrule
+stage 2, v10                 & easy & 100\% & 0.994 & 2.20 & 1.138 \\
+                             & mid  & 96.7\% & 0.992 & 3.24 & 1.205 \\
+                             & hard & 100\% & 0.987 & 7.33 & 1.229 \\
+                             & all  & 98.9\% & 0.991 & 4.27 & 1.206 \\
+\midrule
+stage 2, v11 (current)       & easy & 100\% & 0.995 & 2.30 & 1.190 \\
+                             & mid  & 100\% & 0.992 & 3.03 & 1.137 \\
+                             & hard & 96.7\% & 0.985 & 7.38 & 1.216 \\
+                             & all  & 98.9\% & 0.991 & 4.20 & 1.191 \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\paragraph{Stage 2 mostly improves placement.} v7 uses $11\%$ fewer guards than stage 1
+($8$--$16\%$ per tier) without deleting a single guard. Pruning cannot explain that gap: removing every
+free guard from stage 1's solutions takes it only from $1.384$ to $1.295$ (mean per-gallery
+ratio), while v7 reaches $1.213$. Most of stage 1's extra guards are each needed, just badly
+placed, and only placing differently from the start removes them. This is the case for
+starting stage-2 episodes from zero guards rather than from stage 1's finished cover.
+
+\paragraph{The development runs.} \Cref{tab:runs} lists each stage-2 run and the change that
+led to the next one. Every run starts from the same stage-1 checkpoint. Each change answers a
+specific failure, and the three policy masks of \cref{sec:arch} come from v6, v7 and v8.
+
+\begin{table}[!htbp]
+\centering\small
+\caption{Stage-2 development runs on the test set, deterministic, from zero guards.
+$k/k_{\mathrm{ref}}$ is the mean per-gallery ratio over solved galleries (it differs slightly
+from \cref{tab:results}). ``Deletions'' are accepted deletions per gallery; ``free left'' is the
+number of free guards still in the final solution on hard galleries.}
+\label{tab:runs}
+\begin{tabularx}{\linewidth}{lXcccc}
+\toprule
+run & change from the previous run & solved & $k/k_{\mathrm{ref}}$ & deletions & free left \\
+\midrule
+stage 1 & add only; guards free & 100\% & 1.384 & -- & 0.37 \\
+v4 & stage 2 as in \cref{sec:ppo}; terminal bonus floored at $w_{\mathrm{goal}}$, $\STOP$ ends the episode & 96.7\% & 1.356 & 0 & 0.70 \\
+v5 & terminal bonus uncapped below (floor $w_{\mathrm{goal,min}}$); $\STOP$ below $c^\dagger$ refused; step limit ends the episode & 82.2\% & 1.240 & 0.01 & 0.48 \\
+v6 & $w_{\mathrm{void}}$ $0.1\to0.5$; two refused actions in a row end the episode & 95.6\% & 1.302 & 0 & 0.77 \\
+v7 & $\STOP$ masked below $c^\dagger$ & 100\% & 1.213 & 0 & 0.13 \\
+v8 & free means the $c^\dagger$ rule; ratchet floor $\min(c^{\mathrm{best}}-0.01,\,c^\dagger)$; $\STOP$ masked while a guard is free & 75.6\% & 1.287 & 0.03 & 0.00 \\
+v8 $+$ mask & $\DEL$ masked below $c^\dagger$, at evaluation only & 100\% & 1.319 & 0.09 & 0.20 \\
+v9 & v8 trained with the $\DEL$ mask & 100\% & 1.232 & 0.10 & 0.40 \\
+v10 & channel 4 redrawn: free guards brightest, never $0$ & 98.9\% & 1.215 & 0.22 & 0.33 \\
+v11 & $\DEL$ gets its own cell map, masked to the guards' cells (current) & 98.9\% & 1.201 & 0.42 & 0.00 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+What the runs show:
+\begin{itemize}
+  \item \textbf{v4--v6:} none of them deleted one of its own guards. v4 never deleted at all;
+        v5 and v6 removed about half of the spares on pre-filled easy and mid galleries. v5's
+        deterministic policy also looped on refused actions until the step limit, which v6's
+        larger $w_{\mathrm{void}}$ and the two-refusal ending removed. v6's remaining failures
+        were all $\STOP$ at $96$--$98\%$ on hard galleries.
+  \item \textbf{v7:} with $\STOP$ masked below $c^\dagger$ every gallery was solved and placement
+        improved steadily, but $\DEL$ fell from $10\%$ of actions to $0$ within $50$k steps. Under
+        the old redundancy rule most deletable guards looked load-bearing (\cref{sec:shaping}),
+        and stopping was always safe.
+  \item \textbf{v8:} with the free-guard rule $\DEL$ stayed at about $40\%$ of actions, and on
+        pre-filled easy galleries it removed $3.6$ of the $4$ spares. But $\DEL$ took over the
+        nearly-covered states too: the failures added guards to just under $98\%$, then chose
+        $\DEL$ until two refusals ended the episode uncovered. The $\DEL$ mask alone, with no retraining, solves all 90 (the
+        v8 rows are its checkpoint at $1.1$M steps, $10\%$ into stage 2).
+  \item \textbf{v9:} trained with the $\DEL$ mask, it solved every training episode
+        throughout and $\DEL$ held at about $35\%$ of actions to the end. Its placement improved
+        more slowly than v7's for most of the stage (validation ratio $1.29$ at $1.5$M steps
+        against v7's $1.22$) and caught up only in the last quarter ($1.226$ against $1.205$ at
+        the end, still falling). Deletion aim did not improve on hard galleries: from a
+        pre-filled start (greedy plus four spares) it removes about $2.9$, $2.6$ and $0.9$ guards
+        on easy, mid and hard galleries and leaves $1.0$, $1.3$ and $2.8$ free guards, and $8$ of
+        the $30$ hard solutions from zero guards still hold a free guard. Removing those would
+        take v9 from $1.232$ to $1.195$ (mean per-gallery ratio). The model saved is the final
+        one: the best-on-validation checkpoint ($2.0$M steps) has a lower ratio ($1.223$) but
+        fails one hard gallery.
+  \item \textbf{v10:} channel 4 used to draw the cheapest free guards at $0$, like empty
+        floor, and v9's refused deletions pointed a median quarter to a third of the diagonal
+        away from any free guard. With free guards drawn brightest, placement improved much
+        faster (validation ratio $1.220$ at $1.5$M steps against v9's $1.291$) and settled
+        between $1.19$ and $1.23$; whether the redrawing or run-to-run variation caused that,
+        one run cannot say. On the test set v10 is level with v7 ($1.215$ against $1.213$
+        deterministic, $1.219$ against $1.223$ sampled) and fails one mid gallery. Deletion aim
+        on hard galleries did not improve: from a pre-filled start it removes $3.3$, $2.6$ and
+        $0.5$ spares on easy, mid and hard galleries, and refused deletions still point far from
+        any free guard. The likely cause is in the network rather than the image: the mode and
+        the cell are drawn independently from one shared cell map, so a $\DEL$ points with the
+        map that $\ADD$, two thirds of all actions, has shaped towards uncovered space, while
+        free guards sit where coverage is overlapping.
+  \item \textbf{v11:} with its own cell map (\cref{sec:action}) $\DEL$ aims at guards. From a
+        pre-filled start it removes $4.0$, $4.0$ and $3.6$ of the four spares on easy, mid and
+        hard galleries, against v10's $3.3$, $2.6$ and $0.5$; on hard galleries $108$ of its
+        $113$ deletions hit a free guard, against v10's $13$ of $73$. From zero guards no
+        solution on any tier keeps a free guard, so pruning its output changes nothing.
+        Placement improved as well: the validation ratio reached $1.167$ (v10: $1.194$, v7:
+        $1.205$), and the test ratio is the lowest of any run ($1.191$; $1.201$ per gallery,
+        $1.197$ sampled, $1.122$ best of five). The one deterministic failure is gallery 29 of the
+        hard tier: after five guards at $97.2\%$ every further $\ADD$ lands where it adds
+        nothing, until the budget of $16$ ends the episode; sampled actions solve it. With the
+        $\ADD$ cell mask (\cref{sec:arch}) added at evaluation, without retraining, gallery 29
+        is solved with four guards, but hard gallery 17 then fails another way: it places
+        guards in new cells, each adding almost nothing, and stalls at $97.85\%$ when the budget
+        runs out. The ratio is unchanged ($1.200$ per gallery).
+\end{itemize}
+
+\paragraph{A caveat on the test set.} The development runs were diagnosed on the test
+galleries, and several changes answer failures seen there. The test numbers are therefore not
+fully held out; a claim about generalisation should be checked on a fresh split generated from
+a new seed.
 
 % ===========================================================================
 \section{MDP formulation and reward}\label{sec:mdp}
@@ -808,9 +1004,9 @@ each part precisely.
 \centering
 \begin{tikzpicture}
   \node[blk, text width=5.6cm] (state) at (0,0) {\textbf{State} $s_t$\\gallery, guards $S_t$, step $t$,\\best coverage so far $c^{\mathrm{best}}_t$};
-  \node[blk, text width=5.6cm] (obs) at (7.4,0) {\textbf{Observation}\\image $64{\times}64{\times}5$: interior, covered,\\uncovered, guards, redundancy\\5 stats: coverage, budget, time,\\cheapest deletion, ratchet room};
+  \node[blk, text width=5.6cm] (obs) at (7.4,0) {\textbf{Observation}\\image $64{\times}64{\times}5$: interior, covered,\\uncovered, guards, free guards\\5 stats: coverage, budget, time,\\free guard exists, ratchet room};
   \node[blk, text width=5.6cm] (pol) at (7.4,-3.0) {\textbf{Policy} (\cref{fig:net})\\action $a_t = [\mu, x, y]$};
-  \node[blk, text width=5.6cm, fill=white] (env) at (0,-3.0) {\textbf{Environment step}\\$\ADD$: project into $\Free$, place a guard\\$\DEL$: remove the nearest guard,\\unless the ratchet refuses\\$\STOP$: end the episode};
+  \node[blk, text width=5.6cm, fill=white] (env) at (0,-3.0) {\textbf{Environment step}\\$\ADD$: project into $\Free$, place a guard\\$\DEL$: remove the nearest guard,\\unless the ratchet refuses\\$\STOP$: end the episode if covered};
   \node[blk, text width=5.6cm, fill=agpaccent!12, draw=agpaccent] (rew) at (0,-5.9) {\textbf{Reward} $r_t$ (exact geometry)\\coverage, guard and redundancy potentials,\\scaffolds, penalties, terminal bonus};
   \draw[flow] (state) -- node[above, font=\small]{render} (obs);
   \draw[flow] (obs) -- (pol);
@@ -867,17 +1063,31 @@ $[\mu, x, y]$ is decoded to the point $q = (x_{\min} + x\,w,\; y_{\min} + y\,h)$
         an index keeps the action fixed-size and independent of guard order, and reuses the
         same point head as $\ADD$. Deletions are subject to a \emph{coverage ratchet}: a
         deletion is refused (state unchanged, penalised) if it would bring coverage below
-        $c^{\mathrm{best}}_t - 0.01$. Undoing real progress is then impossible rather than
-        merely costly.
-  \item[$\STOP$.] Ends the episode with the current guard set.
+        \[
+          \min\bigl(c^{\mathrm{best}}_t - 0.01,\; c^\dagger\bigr).
+        \]
+        Any deletion that keeps the gallery solved therefore goes through, however much
+        coverage it costs; a dip below $c^\dagger$ is allowed only within $1\%$ of the best
+        coverage so far, and is then repaired with $\ADD$. Undoing real progress is
+        impossible rather than merely costly. The earlier floor, $c^{\mathrm{best}}_t - 0.01$
+        alone, refused 2 of the 10 deletions that would have tidied v7's test solutions.
+  \item[$\STOP$.] Ends the episode with the current guard set if $f(S_t)\ge c^\dagger$.
+        Below the threshold it is refused: the state is unchanged and the step is penalised.
+        A deletion that dips under $c^\dagger$ is then something to repair, not a way to end
+        the episode. (The policy masks $\STOP$ there anyway, \cref{sec:arch}; the refusal keeps
+        the MDP correct for any policy.)
 \end{description}
 
-\paragraph{Termination and truncation.}
-The episode \emph{terminates} on $\STOP$; when an $\ADD$ reaches the budget of $16$ guards;
-and, in stage 1 only, as soon as $f\ge c^\dagger$ (in stage 2 it continues so that pruning
-can happen). It is \emph{truncated} after $40$ steps. Truncation is a safety net, not part of
-the problem: no terminal reward is paid, and PPO bootstraps from the value function instead,
-which would double-count if we also paid out.
+\paragraph{Termination.}
+The episode \emph{terminates}, with the terminal reward of \cref{sec:reward}, on an accepted
+$\STOP$; when an $\ADD$ reaches the budget of $16$ guards; in stage 1 only, as soon as
+$f\ge c^\dagger$ (in stage 2 it continues so that pruning can happen); after $40$ steps; and
+after two refused actions in a row (a refused $\DEL$ or $\STOP$). There is no truncation. The
+step count is in the observation, and with $\STOP$ refused below $c^\dagger$, bootstrapping at
+the step limit would let a policy that cannot cover avoid the failure penalty by stalling. A
+refused action leaves the state unchanged, so a deterministic policy that takes one will take
+it again forever; the two-refusal limit ends that loop, and the episode is scored like any
+other ending, covered or not.
 
 \paragraph{Why a budget of 16.}
 Greedy needs at most $11$ guards on any training gallery, so $16$ leaves room for stage 1 to
@@ -889,7 +1099,7 @@ are checked against this value and must be rechecked if it changes.
 
 \begin{table}[!htbp]
 \centering\small
-\caption{Observation. Image channels are $0/255$ masks except channel 4.}
+\caption{Observation (\code{env.py}). Image channels are $0/255$ masks except channel 4.}
 \label{tab:obs}
 \begin{tabularx}{\linewidth}{lX}
 \toprule
@@ -898,26 +1108,35 @@ are checked against this value and must be rechecked if it changes.
 1 covered & pixels seen by at least one guard \\
 2 uncovered & interior pixels seen by no guard: the work left \\
 3 guards & each guard as a $3\times3$ blob, so it survives strided convolutions \\
-4 redundancy & each guard's blob shaded by $\min(1, \hat\delta^-_j/\sigma_p)$, where
-$\hat\delta^-_j$ is the raster estimate of its exclusive area and $\sigma_p = 0.005$; dark
-means nearly free to delete \\
+4 free guards & each guard's blob: a free guard at $255$ down to $128$, brightest when its
+deletion costs nothing and dimmer by the share of the headroom $f(S_t)-c^\dagger$ it would use
+up; a load-bearing guard at $64$. Bright means ``delete this'', and no guard is drawn at $0$, the
+value of empty floor. Below $c^\dagger$ no guard is free, but one that sees nothing no other
+guard sees is still drawn at $255$. The gap between the bands keeps the two apart however close
+to the line a guard is \\
 \midrule
 \multicolumn{2}{l}{\emph{Scalars} (all clipped to $[0,1]$)} \\
 coverage & exact $f(S_t)$ \\
 budget used & $k_t/16$ \\
 time used & $t/40$ \\
-cheapest deletion & $\min(1, \min_j \hat\delta^-_j/\sigma_p)$; $0$ means a free deletion exists now \\
-ratchet room & $f(S_t) - (c^{\mathrm{best}}_t - 0.01)$: coverage a deletion may still cost \\
+free guard exists & $0$ if some guard is free, else $1$; the policy masks $\STOP$ on it \\
+ratchet room & $f(S_t) - \min(c^{\mathrm{best}}_t - 0.01, c^\dagger)$: coverage a deletion may still cost \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 \Cref{tab:obs} lists the observation. Channel 2 tells the policy where the work is; channel 4
-is what makes $\DEL$ learnable at all, since without it a load-bearing guard and a redundant
-one look identical. The raster estimate $\hat\delta^-_j$ counts pixels seen by guard $j$ and
-by no other guard, one vectorised operation per guard. The exact $\delta^-$, a polygon union
-over the other guards, is computed only when a deletion actually happens, for the reward and
-the ratchet.
+is what makes $\DEL$ learnable at all, since without it a load-bearing guard and a free one
+look identical. Free guards are drawn brighter than load-bearing ones and never at $0$: up to
+v9 the order was reversed, the cheapest free guards were drawn at $0$ like empty floor, and
+v9's refused deletions pointed a median quarter to a third of the diagonal away from any free
+guard. Which guards are free is decided on the exact $\delta^-$, so it agrees with
+what a deletion would actually do. The exact value is a polygon union over the other guards,
+about $3$\,ms each, and computing it for every guard on every step made training $2$--$5\times$
+slower. The raster estimate $\hat\delta^-_j$, pixels seen by guard $j$ and by no other guard, is
+off by under $1\%$ of the gallery, so a guard whose estimate is more than $1\%$ from the
+headroom is settled by the raster alone, and only the few near the line get the exact union.
+On $3{,}385$ guards from random play this matched the exact rule every time.
 
 \subsection{Reward}\label{sec:reward}
 
@@ -935,16 +1154,20 @@ r^{\mu}_t \;=\;
   -w_{\mathrm{stop}}\Ind{f(S_t) < c^\dagger}, & \mu=\STOP,
 \end{cases}
 \]
-where $R$ is the soft redundant-guard count of \cref{sec:shaping}, recomputed after every
-step whatever the mode, plus, on termination only,
+where $R$ is the number of free guards of \cref{sec:shaping}, recomputed after every step
+whatever the mode, plus, on termination only,
 \[
   r^{\mathrm{term}} \;=\;
   \begin{cases}
-    w_{\mathrm{goal}} + w_{\mathrm{pars}}\max(k_{\mathrm{ref}} - k_T,\, 0), & f(S_T)\ge c^\dagger,\\
+    \max\bigl(w_{\mathrm{goal}} + w_{\mathrm{pars}}(k_{\mathrm{ref}} - k_T),\; w_{\mathrm{goal,min}}\bigr), & f(S_T)\ge c^\dagger,\\
     -w_{\mathrm{fail}}, & \text{otherwise.}
   \end{cases}
 \]
-where the scaffold reward of a placement is
+Every guard below $k_{\mathrm{ref}}$ earns $w_{\mathrm{pars}}$ and every guard above it costs
+$w_{\mathrm{pars}}$, so spare guards left at the end are visibly worse than clearing them; the
+floor keeps even a wasteful cover ($+1$) better than failing ($-2$). An earlier version floored
+the parsimony part at zero, $w_{\mathrm{pars}}\max(k_{\mathrm{ref}}-k_T,0)$, so a policy at or
+above greedy's count lost nothing by stopping with spares. The scaffold reward of a placement is
 \[
   r^{\mathrm{scaf}}_t \;=\; w_{\mathrm{front}}\Ind{g\notin\Cov(S_t)} + w_{\mathrm{sweep}}\,\kappa_t(g)
   - w_{\mathrm{sep}}\Ind{\textstyle\min_j\lVert g-g_j\rVert < 0.15\,D}.
@@ -953,6 +1176,18 @@ The sweep kernel favours the wall early and the interior later:
 $\kappa_t(g) = \exp\bigl(-(\dbd(g)/D - m_t)^2/(2\cdot0.05^2)\bigr)$ with
 $m_t = 0.02 + 0.23\,k_t/16$. \Cref{tab:weights} gives every weight;
 \cref{fig:curriculum} shows how they move over training.
+
+\paragraph{Optional: scaling parsimony by shape complexity.} With
+\code{-{}-scale-by-reflex}, the parsimony weights $w_{\mathrm{par}}$, $w_{\mathrm{prune}}$ and
+$w_{\mathrm{pars}}$ of an episode are multiplied by $\mathrm{clip}(r_\Gallery/\bar r,\,0.5,\,2)$,
+where $r_\Gallery$ is the gallery's number of reflex vertices (corners with an interior angle
+above $180^\circ$; a corner of a hole is reflex for the gallery when it is convex for the hole) and $\bar r$ its mean over the
+training set. The reflex count is the usual complexity measure for the problem: in a simple
+polygon, $r$ reflex vertices never need more than $r$ guards. It correlates $0.92$ with $k_{\mathrm{ref}}$
+without using the tier label: averages are $10.6$, $23.9$ and $55.2$ on the easy, mid and hard
+training galleries, with overlapping ranges. Guards then cost more, and deletions pay more,
+on complex shapes. A constant factor on a potential is still a potential, so the
+scaling cannot be farmed. It is off in every run reported here.
 
 \begin{table}[!htbp]
 \centering\small
@@ -965,25 +1200,26 @@ group & weight & role & \stageI{} & \stageII{} \\
 \midrule
 coverage   & $w_{\mathrm{cov}}$   & area gained / lost (potential) & 1.0 & 1.0 \\
            & $w_{\mathrm{goal}}$  & terminal bonus for $f\ge c^\dagger$ & 4.0 & 4.0 \\
+           & $w_{\mathrm{goal,min}}$ & floor on that bonus after the parsimony charge & 1.0 & 1.0 \\
            & $w_{\mathrm{fail}}$  & terminal penalty otherwise & 2.0 & 2.0 \\
 parsimony  & $w_{\mathrm{par}}$   & cost per guard, refunded on deletion (potential) & 0 & 0.15 \\
-           & $w_{\mathrm{prune}}$ & drop in the soft count of redundant guards $R$ (potential) & 0 & 0.20 \\
-           & $w_{\mathrm{pars}}$  & terminal bonus per guard saved vs.\ $k_{\mathrm{ref}}$ & 0 & 0.50 \\
+           & $w_{\mathrm{prune}}$ & drop in the number of free guards $R$ (potential) & 0 & 0.20 \\
+           & $w_{\mathrm{pars}}$  & terminal bonus per guard below $k_{\mathrm{ref}}$, charge per guard above & 0 & 0.50 \\
 scaffolds  & $w_{\mathrm{front}}$ & guard placed in uncovered space & 0.04 & 0 \\
            & $w_{\mathrm{sweep}}$ & boundary-first, then inward & 0.06 & 0 \\
            & $w_{\mathrm{sep}}$   & penalty for a guard within $0.15D$ of another & 0.10 & 0 \\
 regularity & $w_{\mathrm{proj}}$  & aimed outside $\Free$ & 0.25 & 0.25 \\
-           & $w_{\mathrm{void}}$  & impossible or refused deletion & 0 & 0.10 \\
-           & $w_{\mathrm{stop}}$  & $\STOP$ before $c^\dagger$ & 0 & 2.0 \\
+           & $w_{\mathrm{void}}$  & impossible or refused deletion & 0 & 0.50 \\
+           & $w_{\mathrm{stop}}$  & $\STOP$ before $c^\dagger$ (refused) & 0 & 2.0 \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 \paragraph{Why each group exists.}
 The coverage, guard-count and redundancy potentials carry the objective
-(\cref{sec:shaping}); the redundancy potential is what pays for deleting redundant guards. The terminal
-terms make crossing $c^\dagger$ the thing that matters, and $w_{\mathrm{pars}}$ rewards beating
-greedy, never punishing a match. The scaffolds make early coverage learning fast: aim at
+(\cref{sec:shaping}); the redundancy potential is what pays for deleting free guards. The terminal
+terms make crossing $c^\dagger$ the thing that matters, and $w_{\mathrm{pars}}$ scores the final
+count against greedy in both directions. The scaffolds make early coverage learning fast: aim at
 uncovered space, trace the boundary first, do not stack guards; being non-potential, they are
 removed before stage 1 ends. The regularity terms keep actions meaningful: aim inside the
 gallery, do not request impossible deletions, do not stop short.
@@ -996,9 +1232,11 @@ gallery, do not request impossible deletions, do not stop short.
   \item \textbf{Stage 2.} The weights blend linearly from the stage-1 column (scaffolds at
         zero) to the stage-2 column over the first $5\%$ of the stage, so the value function
         is not hit by a step change in its targets. $40\%$ of stage-2 episodes start
-        \emph{presaturated}: the stored greedy cover plus $4$ guards at random interior
-        points. Those extras are redundant by construction, so free deletions exist from the
-        first step and $\DEL$ gets a dense learning signal.
+        \emph{presaturated}: the stored greedy cover (before greedy's own prune step) plus
+        $4$ guards at random interior points. The gallery is covered before the extras go in,
+        so the start holds about $4$ deletable guards and $\DEL$ gets a learning signal from the
+        first step. Almost all of them come from the extras: greedy's prune removes a guard in
+        only $59$ of $600$ training galleries.
   \item A callback pushes the current weights to every environment every 4096 steps; the
         environment has no notion of stage beyond its weights and the \code{allow\_delete}
         flag.
@@ -1014,68 +1252,106 @@ The weights are sized so that no shortcut beats solving the gallery.
   \item \textbf{Parsimony never makes failure attractive (stage 2).} A full budget costs
         $16\times0.15 = 2.4$, less than the $w_{\mathrm{goal}}+w_{\mathrm{fail}} = 6$ swing
         between solving and failing.
-  \item \textbf{Pruning is worth doing.} Deleting a fully redundant guard lowers $R$ by at
-        least $1$, so it returns at least $w_{\mathrm{par}} + w_{\mathrm{prune}} = 0.35$, large
-        relative to per-step noise. It returns more when the deletion also makes a partner
-        load-bearing: if two guards cover the same region, both count as redundant, and
-        removing one drops $R$ by $2$, for $0.15 + 0.20\times2 = 0.55$. A guard's contribution
-        to $R$ decays as $\exp(-\hat\delta^-/0.005)$, by a factor $e$ for every half percent of
-        the gallery it alone covers, so deleting a load-bearing guard earns almost nothing from
-        $R$ and pays the coverage loss in full.
-  \item \textbf{Stopping early is costly.} $\STOP$ below $c^\dagger$ costs $w_{\mathrm{stop}} =
-        2$ plus the $w_{\mathrm{fail}} = 2$ terminal penalty.
+  \item \textbf{Pruning is worth doing.} Deleting a free guard lowers $R$ by at least $1$, so
+        it returns at least $w_{\mathrm{par}} + w_{\mathrm{prune}} = 0.35$ at once, less the
+        coverage it costs (at most the headroom above $c^\dagger$, so under $0.02$), plus
+        $w_{\mathrm{pars}} = 0.5$ at the end: about $0.85$ in all. It returns more when the
+        deletion also makes a partner load-bearing: if two guards cover the same region, both
+        are free, and removing one drops $R$ by $2$, for $0.15 + 0.20\times2 = 0.55$ at once.
+  \item \textbf{A refused deletion costs more than a lucky one gains, often enough.} A refused
+        $\DEL$ costs $w_{\mathrm{void}} = 0.5$, so aiming $\DEL$ pays only where it hits a free
+        guard more than about $0.5/(0.5+0.85)\approx 37\%$ of the time. At $0.1$ it paid even
+        at one hit in eight, and $\DEL$ stayed the likeliest action in states where every guard
+        was load-bearing, which a deterministic policy then repeated until the step limit.
+  \item \textbf{Moving a guard is free.} A $\DEL$ followed by an $\ADD$ nets out in every
+        potential, so relocating a guard costs nothing in itself and pays off only through
+        the final count.
+  \item \textbf{Stopping early is costly.} A refused $\STOP$ costs $w_{\mathrm{stop}} = 2$ and
+        the episode goes on; the policy masks it in any case.
 \end{itemize}
 
 \paragraph{Why the pruning reward is a potential.}
-The obvious alternative, a bonus $w_{\mathrm{prune}}\exp(-\delta^-/\sigma_p)$ paid on each
-deletion, can be farmed. Adding a guard in already covered space costs $w_{\mathrm{par}} =
+The obvious alternative, a bonus $w_{\mathrm{prune}}$ paid on each deletion of a free guard,
+can be farmed. Adding a guard in already covered space costs $w_{\mathrm{par}} =
 0.15$, and deleting it straight away pays $w_{\mathrm{par}} + w_{\mathrm{prune}} = 0.35$: a net
 $+0.20$ per two steps, which over a 40-step episode approaches the goal bonus. Paying the
-change of $R$ instead closes the loop exactly: adding a redundant guard raises $R$ by $1$
+change of $R$ instead closes the loop exactly: adding a guard in covered space raises $R$ by $1$
 and costs $w_{\mathrm{prune}}$, deleting it lowers $R$ by $1$ and pays $w_{\mathrm{prune}}$
 back, and the cycle nets zero. Over any episode the pruning reward totals
 $w_{\mathrm{prune}}(R(s_0)-R(s_T))$, which is bounded and is earned only by ending with fewer
-redundant guards than at the start.
+free guards than at the start.
 
 % ===========================================================================
-\section{Optional stage 3: relocation}\label{sec:stage3}
+\section{Open settings and a possible relocation move}\label{sec:next}
 % ===========================================================================
 
-Stage 2 can only remove guards that are already redundant. It cannot move a guard so that a
-\emph{neighbour} becomes redundant, which is where the remaining gap to the optimum lies, and
-which greedy, never revisiting a choice, cannot do either. A third stage would add a $\MOVE$
-mode: select the guard nearest to the chosen point and displace it by a bounded continuous
-vector. Delete-then-add cannot substitute for it, because the ratchet refuses to delete any
-guard that alone covers more than $1\%$ of the gallery.
+\subsection{Settings that were chosen, not tuned}
 
-What it would need:
+Two settings have been fixed since the first implementation and no run has varied them.
+Each can be checked from the existing stage-1 checkpoint with a few short stage-2 runs.
+
+\begin{description}[leftmargin=1.6em]
+  \item[Guard budget, 16 (\code{max\_guards}).] It must leave room above greedy's count, at
+        most $11$ on a training gallery, yet stay tight enough that running out means
+        something. \emph{To check:} log how often episodes end at the budget, per tier and
+        stage. A budget that is never hit is not binding, and one hit often in stage 1 is too
+        tight. Then train with $12$, $16$ and $20$ and compare the validation score, solved
+        rate and guard ratio. Three things depend on it and must move with it: the observed
+        budget fraction $k/16$, the stage-1 scaffold sizing of \cref{sec:calib}, and the room
+        for spares below. Because the observation changes, stage 1 has to be retrained too.
+  \item[Pre-filled starts, 4 spares on 40\% of episodes.] The policy's own solutions leave at most a few free guards
+        (none for v11, \cref{tab:runs}), far fewer than the $4$ it practises on, and a fixed $4$ never
+        shows it a state with one stray guard. \emph{To check:} short stage-2 runs from the same
+        checkpoint with spares fixed at $2$ and $4$ and drawn uniformly from $1$--$4$, and with
+        $20$, $40$ and $60\%$ pre-filled starts. Compare the validation score, the free guards
+        left in solutions from zero guards, and the share of $\DEL$ actions that hit a free guard.
+        More than $4$ spares needs a larger budget, since $11+5$ already reaches $16$. The
+        two settings are \code{presaturate\_extra} in \code{env.py} and \code{-{}-presaturate}.
+\end{description}
+The same procedure applies to the other fixed constants: the ratchet's $1\%$ dip allowance,
+the two-refusal limit and the reflex scaling of \cref{sec:reward}.
+
+\subsection{Is a relocation move needed?}
+
+A $\MOVE$ mode would select the guard nearest a point and displace it by a bounded
+continuous vector. Delete-then-add already relocates a guard at zero net reward whenever the
+deletion passes the ratchet, so a dedicated move pays only if the policy's solutions can be
+improved by moves it cannot make today. That can be measured before building anything, on
+the best checkpoint's test solutions:
+\begin{enumerate}
+  \item \textbf{Free guards left.} Remove free guards from each final solution until none
+        remains. If almost none are left, deletion has nothing more to do, and the remaining
+        gap to greedy is placement. For v11 none are left on any tier, so this check is
+        already answered and the probe below is the next measurement.
+  \item \textbf{A one-move probe.} For each solution, try moving each guard to each of greedy's
+        candidate points, and after each move apply the prune rule. Count the galleries where
+        some single move frees a guard, and the guard ratio after the best move. Repeat with
+        two moves. If a meaningful share of galleries improves, relocation would pay; if
+        almost none do, a $\MOVE$ action would double the continuous action without a payoff.
+  \item \textbf{Does the policy relocate already?} Count $\DEL$ steps followed directly by an
+        $\ADD$ in the trained policy's episodes, and whether those episodes end with fewer
+        guards than they would without the pair.
+\end{enumerate}
+
+If the probe says yes, the design is cheap to add to this architecture:
 \begin{itemize}
-  \item \textbf{A displacement head.} The spatial policy accommodates this naturally: a second
-        pair of Beta maps per cell gives a bounded displacement for the guard selected in that
-        cell, and the log-probability factorises as in \cref{sec:action}.
+  \item \textbf{A displacement head.} $\MOVE$ gets its own cell map, as $\DEL$ has, masked
+        to the guards' cells, and a second pair of Beta maps per cell gives a bounded
+        displacement for the guard selected in that cell, and the log-probability factorises
+        as in \cref{sec:action}.
   \item \textbf{Reward.} The potentials already value a move correctly: coverage pays
         $w_{\mathrm{cov}}(f(S') - f(S))$, the redundancy potential pays
-        $w_{\mathrm{prune}}(R(s)-R(s'))$ when the move makes a neighbour redundant, and the
-        guard count does not change. No new reward term is needed.
-  \item \textbf{Ratchet interaction.} A move that lowers coverage below
-        $c^{\mathrm{best}}-0.01$ should be refused like a deletion, or the slack widened for
-        moves, since a good relocation can pass through a temporary loss.
-  \item \textbf{Constraint-based regularity.} The curriculum design proposes moving the
-        regularity terms into a per-step constraint solved with N-P3O or CPO
-        \cite{lee2023constrained,achiam2017cpo}, with threshold $h = 1.5\times$ the greedy
-        solver's mean per-step regularity cost. A fixed penalty is negligible next to the
-        first guard's gain but dominant next to the last sliver's, which suppresses exactly
-        the delicate end-game moves stage 3 is for.
-  \item \textbf{Hard-instance sampling.} Reweight the tiers towards hard galleries and sample
-        instances in proportion to their recent failure rate.
-  \item \textbf{A stronger reference.} Claiming a gap to the optimum rather than to greedy
-        needs an exact or near-exact solver \cite{couto2011,tozoni2016} on a sample of
-        galleries.
+        $w_{\mathrm{prune}}(R(s)-R(s'))$ when the move frees a neighbour, and the guard count
+        does not change. No new reward term is needed.
+  \item \textbf{Ratchet and masks.} A move should face the same floor as a deletion, and be
+        masked below $c^\dagger$ like $\DEL$, since a move is a deletion and an addition in one.
 \end{itemize}
 
-The prerequisite is that stage 2 prunes reliably. Relocation exists to remove guards that
-pruning cannot; if pruning does not yet work, adding $\MOVE$ doubles the continuous action
-dimension without addressing the actual bottleneck.
+Other directions from the curriculum design remain open: replacing the fixed regularity
+penalties with a per-step constraint solved by N-P3O or CPO
+\cite{lee2023constrained,achiam2017cpo}; sampling hard galleries in proportion to their recent
+failure rate; and, to claim a gap to the optimum rather than to greedy, an exact or near-exact
+solver \cite{couto2011,tozoni2016} on a sample of galleries.
 
 \bibliographystyle{plainnat}
 \bibliography{refs}

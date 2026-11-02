@@ -17,7 +17,7 @@ script sets at runtime through `set_config` / `set_weights` (called with
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional
 
 import gymnasium as gym
@@ -25,7 +25,7 @@ import numpy as np
 from gymnasium import spaces
 
 from .gallery import Gallery
-from .polygons import augment_record
+from .polygons import augment_record, reflex_count
 from .rewards import RewardShape, RewardWeights, SATURATE
 
 
@@ -52,7 +52,7 @@ class EnvConfig:
     # budget of 16 leaves room to over-saturate and then prune without ever
     # being so loose that running out of guards stops meaning anything.
     max_guards: int = 16          # hard budget; hitting it ends the episode as a failure
-    max_steps: int = 40           # wall-clock safety net, not part of the MDP
+    max_steps: int = 40           # episode ends here; the step count is observed
     coverage_threshold: float = 0.98   # c-dagger: "covered enough"
 
     # --- observation ---
@@ -62,10 +62,26 @@ class EnvConfig:
     allow_delete: bool = False    # stage 1 masks Del and Stop off entirely
 
     # --- coverage ratchet (s6.5) ---
-    # A deletion is refused outright if it would drop coverage more than this
-    # far below the best coverage seen in the episode. Makes catastrophic
-    # unlearning impossible rather than merely expensive.
+    # A deletion is refused outright if it would drop coverage below both the
+    # threshold and this far below the best coverage seen in the episode. So
+    # any deletion that keeps the gallery covered goes through, a small dip
+    # under the threshold (repaired with Add) is allowed, and catastrophic
+    # unlearning is impossible rather than merely expensive.
     ratchet_slack: float = 0.01
+
+    # --- shape-complexity scaling ---
+    # Multiply the parsimony weights (par, prune, pars) for an episode by the
+    # gallery's reflex-vertex count over the dataset mean, clipped to this
+    # range, so guards cost more -- and deletions pay more -- on complex shapes.
+    # A per-episode constant on a potential is still a potential.
+    scale_by_reflex: bool = False
+    reflex_scale_range: tuple = (0.5, 2.0)
+
+    # --- refused actions ---
+    # A refused Delete or Stop leaves the state unchanged, so a deterministic
+    # policy that takes one will take it again forever. This many in a row end
+    # the episode, scored like any other ending (covered or not).
+    noop_limit: int = 2
 
     # --- episode initialisation (s7.1 of the curriculum document) ---
     augment: bool = True              # apply a random D4 symmetry to the gallery
@@ -97,6 +113,8 @@ class ArtGalleryEnv(gym.Env):
         self.weights = weights or SATURATE
         self.shape = shape or RewardShape()
         self._rng = np.random.default_rng(seed)
+        self._reflex_mean = float(np.mean([reflex_count(r) for r in records]))
+        self.parsimony_scale = 1.0
 
         # --- spaces -------------------------------------------------------
         # Action: [mode, x, y]. mode is ADD/DEL/STOP as 0/1/2; x and y are in
@@ -149,6 +167,11 @@ class ArtGalleryEnv(gym.Env):
         # The greedy solver's guard count is the baseline the terminal parsimony
         # bonus is scored against. Fall back to something sane if absent.
         self.k_ref = max(int(record.get("k_ref", 8)), 1)
+        if self.config.scale_by_reflex:
+            low, high = self.config.reflex_scale_range
+            self.parsimony_scale = float(np.clip(reflex_count(record) / self._reflex_mean, low, high))
+        else:
+            self.parsimony_scale = 1.0
 
         # --- 2. optionally start from an over-saturated state (stage 2) ---
         # Deliberate over-saturation: lay down the greedy cover, then a handful
@@ -161,7 +184,9 @@ class ArtGalleryEnv(gym.Env):
 
         # --- 3. episode bookkeeping ---
         self.step_count = 0
+        self.noops = 0
         self.best_coverage = self.gallery.coverage
+        self._refresh_free()
         self.redundancy = self._redundancy()
         self.episode_return = 0.0
 
@@ -188,7 +213,7 @@ class ArtGalleryEnv(gym.Env):
     # Step
     # -----------------------------------------------------------------------
     def step(self, action):
-        weights = self.weights
+        weights = self._episode_weights()
         mode, x, y = self._decode(action)
 
         reward = 0.0
@@ -244,8 +269,7 @@ class ArtGalleryEnv(gym.Env):
                 reward -= weights.void
             else:
                 cost = self.gallery.exact_exclusive_area(index)
-                floor = self.best_coverage - self.config.ratchet_slack
-                if self.gallery.coverage - cost < floor:
+                if self.gallery.coverage - cost < self._ratchet_floor():
                     # The ratchet refuses deletions that would undo real work.
                     reward -= weights.void
                     info["blocked"] = True
@@ -258,16 +282,21 @@ class ArtGalleryEnv(gym.Env):
                     info["delta"] = -delta_minus
 
         # =================== STOP ==========================================
+        # Refused below the threshold: a Delete that dips coverage under it is
+        # then something to repair with Add, not a way to lose the episode.
         else:
-            terminated = True
-            if self.gallery.coverage < self.config.coverage_threshold:
-                reward -= weights.stop      # stopping short of the goal
+            if self.gallery.coverage >= self.config.coverage_threshold:
+                terminated = True
+            else:
+                reward -= weights.stop
+                info["refused"] = True
 
         # --- redundancy potential -------------------------------------------
         # Paid as a difference of potentials, so it telescopes over an episode
         # and cannot be farmed: adding a redundant guard costs exactly what
         # deleting it pays back. A per-deletion bonus could be -- add a useless
         # guard (-par), delete it (+par +prune), repeat -- for +prune a cycle.
+        self._refresh_free()
         redundancy = self._redundancy()
         reward += weights.prune * (self.redundancy - redundancy)
         self.redundancy = redundancy
@@ -276,9 +305,18 @@ class ArtGalleryEnv(gym.Env):
         self.step_count += 1
         self.best_coverage = max(self.best_coverage, self.gallery.coverage)
 
-        truncated = (not terminated) and self.step_count >= self.config.max_steps
+        # The step limit is a real ending: the step count is in the observation,
+        # and with Stop refused below the threshold, bootstrapping here would let
+        # a policy that cannot cover dodge the failure penalty by stalling.
+        if self.step_count >= self.config.max_steps:
+            terminated = True
+        refused = (mode == DEL and "delta" not in info) or info.get("refused", False)
+        self.noops = self.noops + 1 if refused else 0
+        if self.noops >= self.config.noop_limit:
+            terminated = True
+        truncated = False
         if terminated:
-            reward += self._terminal_reward()
+            reward += self._terminal_reward(weights)
 
         self.episode_return += reward
         info.update(self._episode_info(terminated or truncated))
@@ -288,34 +326,45 @@ class ArtGalleryEnv(gym.Env):
     # -----------------------------------------------------------------------
     # Reward helpers
     # -----------------------------------------------------------------------
-    def _terminal_reward(self) -> float:
-        """
-        Paid once, when the episode really ends (s6.4).
+    def _episode_weights(self) -> RewardWeights:
+        """The current weights with the parsimony group scaled for this gallery."""
+        s = self.parsimony_scale
+        if s == 1.0:
+            return self.weights
+        w = self.weights
+        return replace(w, par=w.par * s, prune=w.prune * s, pars=w.pars * s)
 
-        Note this is NOT paid on truncation. Truncation is the step-limit safety
-        net, an artefact of the implementation rather than part of the MDP;
-        Stable-Baselines3 bootstraps the value function there instead, which is
-        the correct handling and would be double-counted if we also paid out.
+    def _ratchet_floor(self) -> float:
+        """Lowest coverage a deletion may leave (see EnvConfig.ratchet_slack)."""
+        return min(self.best_coverage - self.config.ratchet_slack, self.config.coverage_threshold)
+
+    def _terminal_reward(self, weights: RewardWeights) -> float:
+        """
+        Paid once, when the episode ends (s6.4): by Stop, by spending the guard
+        budget, or at the step limit.
         """
         covered = self.gallery.coverage >= self.config.coverage_threshold
         if not covered:
-            return -self.weights.fail
+            return -weights.fail
 
-        # Guards saved relative to the greedy baseline, never negative -- the
-        # agent is rewarded for beating greedy, not punished for matching it.
-        saved = max(self.k_ref - self.gallery.n_guards, 0)
-        return self.weights.goal + self.weights.pars * saved
+        # Guards saved relative to the greedy baseline: a bonus for each below
+        # it and a charge for each above, so spare guards left at Stop cost
+        # something. The floor keeps a wasteful cover better than failing.
+        saved = self.k_ref - self.gallery.n_guards
+        return max(weights.goal + weights.pars * saved, weights.goal_min)
+
+    def _refresh_free(self):
+        """Recompute, once per state, which guards can go without uncovering the gallery."""
+        self.deficits = self.gallery.exclusive_areas()
+        self.free = self.gallery.removable(self.config.coverage_threshold, self.deficits)
 
     def _redundancy(self) -> float:
         """
-        Soft count of redundant guards: sum over guards of exp(-delta_minus / sigma).
-
-        A guard that sees nothing on its own counts as 1, one that alone covers
-        well over sigma of the gallery counts as ~0. The prune reward is paid on
-        changes in this number.
+        Number of free guards: those whose deletion alone keeps coverage at or
+        above the threshold. The prune reward is paid on changes in this number,
+        so "redundant" means exactly what the episode's success rule allows.
         """
-        deficits = self.gallery.exclusive_areas()
-        return float(np.exp(-deficits / self.shape.sigma_prune).sum())
+        return float(self.free.sum())
 
     def _sweep_kernel(self, wall_distance: float) -> float:
         """
@@ -359,8 +408,9 @@ class ArtGalleryEnv(gym.Env):
 
         Channels 0-2 describe the gallery and the job left to do; channels 3-4
         describe the guards. Channel 4 is what makes pruning learnable at all:
-        without it the policy cannot tell a load-bearing guard from a redundant
-        one, and Del is a blind guess.
+        without it the policy cannot tell a load-bearing guard from a free one,
+        and Del is a blind guess. "Free" is the success rule itself -- deleting
+        the guard alone keeps coverage at or above the threshold.
         """
         gallery = self.gallery
         size = self.config.img_size
@@ -371,21 +421,18 @@ class ArtGalleryEnv(gym.Env):
         image[:, :, 2] = gallery.uncovered_mask().astype(np.uint8) * 255  # still to do
         image[:, :, 3] = gallery.guard_mask().astype(np.uint8) * 255    # guard positions
 
-        deficits = gallery.exclusive_areas()
-        image[:, :, 4] = gallery.redundancy_mask(self.shape.sigma_prune, deficits)  # cost to delete
-
-        # Cheapest guard to remove, in units of the pruning tolerance. 0 means
-        # "there is a free deletion available right now".
-        cheapest = float(deficits.min()) if deficits.size else 1.0
-        cheapest = min(cheapest / self.shape.sigma_prune, 1.0)
+        headroom = gallery.coverage - self.config.coverage_threshold
+        image[:, :, 4] = gallery.redundancy_mask(self.free, self.deficits, headroom)  # cost to delete
 
         stats = np.array([
             gallery.coverage,
             gallery.n_guards / self.config.max_guards,
             self.step_count / self.config.max_steps,
-            cheapest,
+            # 0 means "there is a free deletion available right now"; the
+            # policy masks Stop on it (SpatialPolicy.stop_while_free).
+            0.0 if self.free.any() else 1.0,
             # Room left under the ratchet before a deletion gets refused.
-            min(max(gallery.coverage - (self.best_coverage - self.config.ratchet_slack), 0.0), 1.0),
+            min(max(gallery.coverage - self._ratchet_floor(), 0.0), 1.0),
         ], dtype=np.float32)
 
         return {"image": image, "stats": np.clip(stats, 0.0, 1.0)}

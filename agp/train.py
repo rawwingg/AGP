@@ -36,7 +36,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMoni
 from . import dataset as dataset_module
 from .callbacks import BestCheckpoint, EpisodeMetrics, TrainingViewer, WeightSchedule
 from .env import ArtGalleryEnv, EnvConfig
-from .policy import SpatialPolicy, SpatialTrunk, prime_mode_head
+from .policy import SpatialPolicy, SpatialTrunk, prime_mode_head, split_delete_map
 from .rewards import PRUNE, RewardShape, SATURATE, prune_weights, saturate_weights
 
 
@@ -188,6 +188,7 @@ def cmd_train(args):
         **stage1_config.__dict__,
         "allow_delete": True,
         "presaturate_prob": args.presaturate,
+        "scale_by_reflex": args.scale_by_reflex,
     })
     env.env_method("set_config", stage2_config)
     env.env_method("set_weights", PRUNE)
@@ -198,21 +199,30 @@ def cmd_train(args):
 
     # Unmask Del and Stop. Their logits were never trained in stage 1, so
     # start the mode head at "mostly Add" rather than wherever it was left.
-    # The priming alone gives Del and Stop enough samples to be learned.
     prime_mode_head(model.policy, add_prob=args.add_prob)
+    # Del gets its own cell map, so where it points no longer has to be where Add points.
+    if not args.shared_map:
+        split_delete_map(model)
+    model.policy.stop_below = args.threshold
+    model.policy.delete_below = args.threshold
 
     # Smaller updates than stage 1. Stage 2 changes the reward under a policy
     # that already covers well; with stage 1's step size, updates reached a KL
-    # above 1 and wiped out the placement skill on hard galleries. The entropy
-    # bonus is not raised either: most of the policy's entropy is the choice of
-    # cell, so a larger bonus mainly blurs where guards go.
+    # above 1 and wiped out the placement skill on hard galleries.
     model.learning_rate = args.stage2_lr
     model._setup_lr_schedule()          # rebuild the schedule from learning_rate
     model.n_epochs = args.stage2_epochs
+
+    # Separate entropy bonuses for the mode and for placement. Priming alone
+    # does not keep Del alive: under the placement-sized bonus the mode head
+    # collapsed onto Stop. Raising the whole bonus instead flattens placement,
+    # because the cell term dominates the joint entropy.
     model.ent_coef = args.ent_coef
+    model.policy.mode_entropy_weight = args.stage2_mode_ent_coef / args.ent_coef
 
     print(f"\n[train] === stage 2: prune ({args.stage2_steps:,} steps, "
-          f"lr {args.stage2_lr:g}, {args.stage2_epochs} epochs) ===")
+          f"lr {args.stage2_lr:g}, {args.stage2_epochs} epochs, "
+          f"entropy: mode {args.stage2_mode_ent_coef:g}, placement {args.ent_coef:g}) ===")
     best = BestCheckpoint(val_records, stage2_config, PRUNE, run_dir, "stage2",
                           every=args.checkpoint_every)
     model.learn(
@@ -366,6 +376,9 @@ def build_parser():
                    help="stage-2 learning rate (smaller than stage 1's to keep its placement skill)")
     p.add_argument("--stage2-epochs", type=int, default=5,
                    help="stage-2 PPO epochs per update")
+    p.add_argument("--stage2-mode-ent-coef", type=float, default=0.03,
+                   help="stage-2 entropy bonus on the Add/Del/Stop choice "
+                        "(placement keeps --ent-coef)")
     p.add_argument("--checkpoint-every", type=int, default=100_000,
                    help="stage-2 steps between saved checkpoints and validation scores")
     p.add_argument("--grid", type=int, default=16,
@@ -378,6 +391,10 @@ def build_parser():
                    help="stage-2 start: probability of Add; Del and Stop share the rest")
     p.add_argument("--presaturate", type=float, default=0.4,
                    help="fraction of stage-2 episodes starting from the greedy cover")
+    p.add_argument("--scale-by-reflex", action="store_true",
+                   help="stage 2: scale the parsimony weights by each gallery's reflex-vertex count")
+    p.add_argument("--shared-map", action="store_true",
+                   help="stage 2: keep one cell map for Add and Del, as up to v10")
     p.add_argument("--viewer-every", type=int, default=20_000,
                    help="timesteps between TensorBoard rollout snapshots")
     p.add_argument("--progress", action="store_true", help="show a progress bar")

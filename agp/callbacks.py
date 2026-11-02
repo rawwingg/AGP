@@ -79,18 +79,25 @@ class EpisodeMetrics(BaseCallback):
 
     Tracked overall and per difficulty tier, because an average across tiers
     hides the usual failure mode: easy galleries solved, hard ones abandoned.
+    Also logs the share of Add, Del and Stop among the rollout's actions: a mode
+    head that has quietly stopped using Del shows up here before the guard
+    counts say anything.
     """
 
     KEYS = ("coverage", "n_guards", "solved", "guard_ratio")
+    MODES = ("add", "del", "stop")      # indexed by env.ADD / DEL / STOP
 
     def __init__(self, window: int = 200, verbose: int = 0):
         super().__init__(verbose)
         self.window = window
         self._overall = {key: deque(maxlen=window) for key in self.KEYS}
         self._by_tier = {}
+        self._mode_counts = np.zeros(len(self.MODES))
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
+            if "mode" in info:
+                self._mode_counts[info["mode"]] += 1
             if "solved" not in info:          # only set on an episode's last step
                 continue
             tier = info.get("tier", "unknown")
@@ -109,6 +116,11 @@ class EpisodeMetrics(BaseCallback):
             for key in ("solved", "guard_ratio"):
                 if buckets[key]:
                     self.logger.record(f"tier_{tier}/{key}", float(np.mean(buckets[key])))
+        total = self._mode_counts.sum()
+        if total:
+            for name, count in zip(self.MODES, self._mode_counts):
+                self.logger.record(f"actions/{name}", float(count / total))
+        self._mode_counts[:] = 0
 
 
 # ---------------------------------------------------------------------------

@@ -340,6 +340,27 @@ class Gallery:
         without = unary_union(remaining).area if remaining else 0.0
         return max(self.covered.area - without, 0.0) / self.area
 
+    def removable(self, floor: float, deficits: Optional[np.ndarray] = None,
+                  screen: float = 0.01) -> np.ndarray:
+        """
+        Which guards could be deleted on their own with coverage staying >= floor.
+
+        Meant to agree with what a deletion would actually do, which is decided
+        on the exact area. The raster estimate is off by under 1% of the
+        gallery, so a guard further than `screen` from the line is settled by
+        the raster alone; only the few near it cost an exact union (each one is
+        ~3 ms, and checking every guard every step made training 2-5x slower).
+        """
+        if deficits is None:
+            deficits = self.exclusive_areas()
+        headroom = self.coverage - floor
+        if headroom < 0:
+            return np.zeros(self.n_guards, dtype=bool)
+        free = deficits <= headroom - screen
+        for i in np.flatnonzero(np.abs(deficits - headroom) < screen):
+            free[i] = self.exact_exclusive_area(int(i)) <= headroom
+        return free
+
     # -----------------------------------------------------------------------
     # Observation channels
     # -----------------------------------------------------------------------
@@ -364,22 +385,30 @@ class Gallery:
             mask[max(row - 1, 0):row + 2, max(col - 1, 0):col + 2] = True
         return mask
 
-    def redundancy_mask(self, sigma: float,
-                        deficits: Optional[np.ndarray] = None) -> np.ndarray:
+    def redundancy_mask(self, free: np.ndarray, deficits: np.ndarray,
+                        headroom: float) -> np.ndarray:
         """
-        Per-guard redundancy, painted at each guard's position and scaled to
-        0..255. Dark means 'nearly free to delete', bright means 'expensive'.
+        Per-guard deletability, painted at each guard's position.
 
-        `sigma` is the pruning tolerance scale from the reward weights, so the
-        channel is calibrated to the same units the reward uses. Pass `deficits`
-        if the caller has already computed them.
+        A guard that can go (`free`, from `removable`) is drawn at 255..128, brightest
+        when deleting it costs nothing and dimmer as it uses up more of the headroom
+        above the coverage threshold; one that cannot is drawn at 64. Bright therefore
+        means "delete this", and no guard is drawn at 0, the value of empty floor.
+        The gap between the two bands keeps "free" and "load-bearing" apart however
+        close to the line a guard is.
+
+        Below the threshold no guard is free, but one that sees nothing no other
+        guard sees (`deficit` 0) is still drawn at 255: deleting it costs nothing,
+        and the policy keeps Add out of its cell, where a guard is known to add
+        nothing (SpatialPolicy.skip_redundant_cells).
         """
         image = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
-        if deficits is None:
-            deficits = self.exclusive_areas()
-        for (x, y), deficit in zip(self.guards, deficits):
+        for (x, y), deficit, ok in zip(self.guards, deficits, free):
             row, col = self._pixel_of(x, y)
-            value = int(255 * min(1.0, deficit / max(sigma, 1e-9)))
+            if ok:
+                value = 255 - int(127 * min(1.0, deficit / max(headroom, 1e-9)))
+            else:
+                value = 255 if headroom < 0 and deficit <= 0 else 64
             image[max(row - 1, 0):row + 2, max(col - 1, 0):col + 2] = value
         return image
 

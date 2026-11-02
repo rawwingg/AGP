@@ -35,12 +35,13 @@ class RewardWeights:
     # --- coverage group: the task objective -------------------------------
     cov: float = 1.0      # coverage potential: +delta_plus on Add, -delta_minus on Del
     goal: float = 4.0     # terminal bonus when the gallery ends up covered
+    goal_min: float = 1.0  # floor on that bonus after the parsimony charge
     fail: float = 2.0     # terminal penalty when it does not
 
     # --- parsimony group: use fewer guards --------------------------------
     par: float = 0.0      # guard-count potential: -1 per Add, +1 per Del
-    prune: float = 0.0    # redundancy potential: paid on the drop in soft-redundant guard count
-    pars: float = 0.0     # terminal bonus per guard saved against the greedy baseline
+    prune: float = 0.0    # redundancy potential: paid on the drop in the number of free guards
+    pars: float = 0.0     # terminal bonus per guard below the greedy baseline, charge per guard above
 
     # --- scaffolding group: learning aids, annealed to zero ---------------
     front: float = 0.0    # placed the guard in still-uncovered space
@@ -50,7 +51,7 @@ class RewardWeights:
     # --- regularity group: keep the agent inside the rules ----------------
     proj: float = 0.25    # aimed outside the gallery and had to be snapped in
     void: float = 0.0     # Del that was impossible or blocked by the ratchet
-    stop: float = 0.0     # Stop called before the gallery was covered
+    stop: float = 0.0     # Stop called before the gallery was covered (refused)
 
     def blend(self, other: "RewardWeights", alpha: float) -> "RewardWeights":
         """Linear interpolation towards `other`; alpha=0 is self, alpha=1 is other.
@@ -77,12 +78,6 @@ class RewardWeights:
 @dataclass(frozen=True)
 class RewardShape:
     """Parameters of the reward's functional forms, as opposed to its weights."""
-
-    # How much lost coverage still counts as "a free deletion". Each guard
-    # counts as exp(-delta_minus / sigma_prune) of a redundant guard, so 0.005
-    # means half a percent of the gallery is the scale at which a guard stops
-    # counting as redundant.
-    sigma_prune: float = 0.005
 
     # Boundary-inward sweep. The preferred distance-to-wall moves from mu_start
     # to mu_end over the guard budget; both are fractions of the bounding-box
@@ -121,16 +116,32 @@ SATURATE = RewardWeights(
 #
 # Weight sizing: a guard costs par = 0.15, so the whole budget of 16 costs 2.4,
 # comfortably less than the 6-point swing between solving and failing. Parsimony
-# can therefore never make failure look attractive. Deleting a fully redundant
-# guard pays par + prune = 0.35, which is large next to the per-step noise, so
+# can therefore never make failure look attractive. Deleting a free guard (one
+# whose loss keeps coverage at or above the threshold) pays at least
+# par + prune = 0.35, which is large next to the per-step noise, so
 # pruning is worth doing but never worth risking the goal for. Both par and
 # prune are potentials (guard count, soft redundant-guard count), so neither
 # can be farmed by adding guards only to delete them again.
+#
+# The terminal bonus is goal + pars * (k_ref - n), floored at goal_min: every
+# guard over the greedy count costs 0.5 at the end, so stopping with spares
+# left is visibly worse than clearing them, while a wasteful cover (+1 at
+# worst) still beats failing (-2). Deletions may dip coverage below the
+# threshold (down to the ratchet); Stop is then refused at a cost of `stop`, so
+# the dip is repaired with Add rather than ending the episode. Delete-then-Add
+# nets out in every potential, so moving a guard is free and pays off only
+# through the guard count at the end.
+#
+# A refused Delete costs void = 0.5. A clean deletion is worth about 0.85
+# (par + prune now, pars at the end), so Delete pays only where it lands on a
+# free guard more than about a third of the time; at 0.1 it paid even at one in
+# eight, and Delete stayed the likeliest action in states where the guard it
+# picks is load-bearing -- which a deterministic policy then repeats forever.
 PRUNE = RewardWeights(
     cov=1.0, goal=4.0, fail=2.0,
     par=0.15, prune=0.20, pars=0.50,
     front=0.0, sweep=0.0, sep=0.0,
-    proj=0.25, void=0.10, stop=2.0,
+    proj=0.25, void=0.50, stop=2.0,
 )
 
 

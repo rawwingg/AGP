@@ -274,3 +274,36 @@ def augment_record(record: dict, index: int) -> dict:
     if record.get("greedy_guards"):
         augmented["greedy_guards"] = transform(record["greedy_guards"])
     return augmented
+
+
+# ---------------------------------------------------------------------------
+# Shape complexity
+# ---------------------------------------------------------------------------
+def _signed_area(points: Sequence[Sequence[float]]) -> float:
+    return 0.5 * sum(x0 * y1 - x1 * y0
+                     for (x0, y0), (x1, y1) in zip(points, list(points[1:]) + [points[0]]))
+
+
+def _convex_corners(points: Sequence[Sequence[float]]) -> int:
+    """Corners of a ring that turn the same way as the ring itself, in either orientation."""
+    turn = 1.0 if _signed_area(points) > 0 else -1.0
+    n, count = len(points), 0
+    for i in range(n):
+        (ax, ay), (bx, by), (cx, cy) = points[i - 1], points[i], points[(i + 1) % n]
+        if turn * ((bx - ax) * (cy - by) - (by - ay) * (cx - bx)) > 0:
+            count += 1
+    return count
+
+
+def reflex_count(record: dict) -> int:
+    """
+    Reflex vertices of the gallery: corners with an interior angle above 180.
+
+    The usual complexity measure for the Art Gallery Problem -- in a simple
+    polygon, r reflex vertices never need more than r guards. A corner of a hole is reflex for
+    the gallery exactly when it is convex for the hole. Invariant under the D4
+    augmentation, which preserves angles.
+    """
+    outer = record["outer_points"]
+    count = len(outer) - _convex_corners(outer)
+    return count + sum(_convex_corners(hole) for hole in record["holes"])
