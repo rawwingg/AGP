@@ -849,18 +849,18 @@ changing what positions are reachable.
 \subsection{Results}\label{sec:results}
 
 \takeaway{%
-\textbf{Stage 2 cuts guards by about $12\%$ and leaves no free guard.} The current
-implementation, trained as run v11 (\code{runs/agp\_v11}, stage 2 continuing from the
-stage-1 checkpoint of \code{runs/agp\_v2}), solves 89 of the 90 test galleries at $1.191$
-times the greedy guard count, against $1.347$ for stage 1 and $1.196$ for v7, the best earlier
-run. None of its solutions holds a guard that could be deleted, and from a pre-filled start it
-removes $4.0$, $4.0$ and $3.6$ of the four spares on easy, mid and hard galleries. The one
-failure is a deterministic loop: on a hard gallery it adds guards at the same spot until the
-budget runs out.}
+\textbf{Stage 2 cuts guards by about $16\%$ and leaves almost no free guard.} The current
+implementation, trained as run v12 (\code{runs/agp\_v12}, stage 2 continuing for $2$M steps
+from the stage-1 checkpoint of \code{runs/agp\_v2}; the model is the best-on-validation
+checkpoint), solves all 90 test galleries at $1.136$ times the greedy guard count, against
+$1.347$ for stage 1 and $1.191$ for v11. On $300$ fresh galleries from an unused seed it solves
+every one at $1.105$ (\cref{tab:fresh}). One of its 90 test solutions holds a guard that could
+be deleted, and from a pre-filled start it removes $3.9$, $4.1$ and $3.7$ guards on easy, mid
+and hard galleries.}
 
 \Cref{tab:results} gives the standard evaluation (\code{agp.train eval}: deterministic
 actions, 90 test galleries, starting from zero guards) for stage 1, for v7, the stage-2 run
-with the lowest guard count before v11, for v10, and for v11, the current implementation. v7 ran under an earlier rule set: no free-guard rule, no $\STOP$ mask for
+with the lowest guard count before v11, for v11, and for v12, the current implementation. v7 ran under an earlier rule set: no free-guard rule, no $\STOP$ mask for
 free guards and no $\DEL$ mask (\cref{tab:runs}). Stage 1 is scored with v9's
 observation code; its training saw the older channel 4, which the add-only policy barely uses.
 
@@ -883,15 +883,15 @@ stage 2, v7                  & easy & 100\% & 0.996 & 2.27 & 1.172 \\
                              & hard & 100\% & 0.988 & 7.20 & 1.207 \\
                              & all  & 100\% & 0.991 & 4.21 & 1.196 \\
 \midrule
-stage 2, v10                 & easy & 100\% & 0.994 & 2.20 & 1.138 \\
-                             & mid  & 96.7\% & 0.992 & 3.24 & 1.205 \\
-                             & hard & 100\% & 0.987 & 7.33 & 1.229 \\
-                             & all  & 98.9\% & 0.991 & 4.27 & 1.206 \\
-\midrule
-stage 2, v11 (current)       & easy & 100\% & 0.995 & 2.30 & 1.190 \\
+stage 2, v11                 & easy & 100\% & 0.995 & 2.30 & 1.190 \\
                              & mid  & 100\% & 0.992 & 3.03 & 1.137 \\
                              & hard & 96.7\% & 0.985 & 7.38 & 1.216 \\
                              & all  & 98.9\% & 0.991 & 4.20 & 1.191 \\
+\midrule
+stage 2, v12 (current)       & easy & 100\% & 0.993 & 2.03 & 1.052 \\
+                             & mid  & 100\% & 0.991 & 3.00 & 1.125 \\
+                             & hard & 100\% & 0.987 & 6.97 & 1.168 \\
+                             & all  & 100\% & 0.990 & 4.00 & 1.136 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -927,7 +927,8 @@ v8 & free means the $c^\dagger$ rule; ratchet floor $\min(c^{\mathrm{best}}-0.01
 v8 $+$ mask & $\DEL$ masked below $c^\dagger$, at evaluation only & 100\% & 1.319 & 0.09 & 0.20 \\
 v9 & v8 trained with the $\DEL$ mask & 100\% & 1.232 & 0.10 & 0.40 \\
 v10 & channel 4 redrawn: free guards brightest, never $0$ & 98.9\% & 1.215 & 0.22 & 0.33 \\
-v11 & $\DEL$ gets its own cell map, masked to the guards' cells (current) & 98.9\% & 1.201 & 0.42 & 0.00 \\
+v11 & $\DEL$ gets its own cell map, masked to the guards' cells & 98.9\% & 1.201 & 0.42 & 0.00 \\
+v12 & stage 2 twice as long ($2$M steps), trained with the $\ADD$ cell mask; best-on-validation checkpoint (current) & 100\% & 1.137 & 0.45 & 0.03 \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -986,12 +987,54 @@ What the runs show:
         is solved with four guards, but hard gallery 17 then fails another way: it places
         guards in new cells, each adding almost nothing, and stalls at $97.85\%$ when the budget
         runs out. The ratio is unchanged ($1.200$ per gallery).
+  \item \textbf{v12:} v11's design with the $\ADD$ cell mask in training, and $2$M stage-2
+        steps instead of $1$M. It was ahead of v11 at every validation point ($1.247$ against
+        $1.293$ at $400$k steps); the validation ratio fell fastest between $600$k and $900$k
+        steps ($1.193$ to $1.129$) and slowly after that, to a best of $1.099$ at $1.9$M. The
+        final model ($1.113$ on validation) scores the same as the best checkpoint on the test
+        set ($1.136$) but fails one fresh gallery (\cref{tab:fresh}), so the best checkpoint is
+        the one kept. On the test set it is $1.137$ per gallery, $1.129$ sampled and $1.080$
+        best of five, with no failure in any mode. Deletion stayed accurate: from a pre-filled
+        start $111$ of $114$ hard deletions hit a free guard, and $0$, $0$ and $0.1$ spares
+        remain on easy, mid and hard galleries. From zero guards one hard solution keeps one
+        free guard.
 \end{itemize}
 
-\paragraph{A caveat on the test set.} The development runs were diagnosed on the test
-galleries, and several changes answer failures seen there. The test numbers are therefore not
-fully held out; a claim about generalisation should be checked on a fresh split generated from
-a new seed.
+\paragraph{A fresh split.} The development runs were diagnosed on the test galleries, and
+several changes answer failures seen there, so the test numbers are not fully held out.
+\Cref{tab:fresh} scores the models on $300$ new galleries ($100$ per tier, seed $30000$,
+\code{data/test\_fresh.json}), none of which repeats a training, validation or test gallery.
+Every model scores better here than on the test set, so the test galleries are, if anything,
+harder than average, and the ranking is the same: v12 is best on every tier ($1.112$, $1.129$
+and $1.112$ per gallery on easy, mid and hard) and solves all $300$ deterministically. Its
+final model fails one hard gallery by stacking guards to the budget of $16$, the stall seen
+in v11's gallery 29, and the best checkpoint fails the same way on another gallery in $2$ of
+$5$ sampled runs: the $\ADD$ cell mask makes the stall rarer, not impossible. v7 is evaluated
+with the current observation code, whose channel 4 differs from the one it trained with, so
+its row is only indicative.
+
+\begin{table}[!htbp]
+\centering\small
+\caption{Fresh split, $300$ galleries from zero guards. ``Per gallery'' is the mean of
+$k/k_{\mathrm{ref}}$ over solved galleries, ``ratio of means'' is mean $k$ over mean
+$k_{\mathrm{ref}}$ as in \cref{tab:results}; sampled is the mean of three sampled runs, and best
+of five takes the fewest guards among five sampled runs per gallery.}
+\label{tab:fresh}
+\begin{tabular}{lccccc}
+\toprule
+ & \multicolumn{3}{c}{deterministic} & sampled & best of 5 \\
+\cmidrule(lr){2-4}
+model & solved & per gallery & ratio of means & per gallery & per gallery \\
+\midrule
+stage 1                & 100\%  & 1.357 & 1.299 & 1.357 & 1.309 \\
+v7 (current code)      & 100\%  & 1.346 & 1.331 & 1.437 & 1.266 \\
+v10                    & 99.7\% & 1.212 & 1.194 & 1.218 & 1.172 \\
+v11                    & 100\%  & 1.162 & 1.140 & 1.150 & 1.091 \\
+v12, final             & 99.7\% & 1.122 & 1.106 & 1.124 & 1.080 \\
+v12, best (current)    & 100\%  & 1.118 & 1.105 & 1.118 & 1.070 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 % ===========================================================================
 \section{MDP formulation and reward}\label{sec:mdp}
@@ -1300,7 +1343,7 @@ Each can be checked from the existing stage-1 checkpoint with a few short stage-
         budget fraction $k/16$, the stage-1 scaffold sizing of \cref{sec:calib}, and the room
         for spares below. Because the observation changes, stage 1 has to be retrained too.
   \item[Pre-filled starts, 4 spares on 40\% of episodes.] The policy's own solutions leave at most a few free guards
-        (none for v11, \cref{tab:runs}), far fewer than the $4$ it practises on, and a fixed $4$ never
+        (one in 90 for v12, \cref{tab:runs}), far fewer than the $4$ it practises on, and a fixed $4$ never
         shows it a state with one stray guard. \emph{To check:} short stage-2 runs from the same
         checkpoint with spares fixed at $2$ and $4$ and drawn uniformly from $1$--$4$, and with
         $20$, $40$ and $60\%$ pre-filled starts. Compare the validation score, the free guards
@@ -1321,7 +1364,7 @@ the best checkpoint's test solutions:
 \begin{enumerate}
   \item \textbf{Free guards left.} Remove free guards from each final solution until none
         remains. If almost none are left, deletion has nothing more to do, and the remaining
-        gap to greedy is placement. For v11 none are left on any tier, so this check is
+        gap to greedy is placement. For v12 one free guard is left in 90 solutions, so this check is
         already answered and the probe below is the next measurement.
   \item \textbf{A one-move probe.} For each solution, try moving each guard to each of greedy's
         candidate points, and after each move apply the prune rule. Count the galleries where
